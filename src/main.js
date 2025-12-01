@@ -1,21 +1,23 @@
-// ClearedJobs.net HTML-only scraper
-// Strategy:
-//  1) Start from Employer Directory (server-rendered) → /employer-directory
-//  2) For each company page, extract links to job detail pages
-//  3) On each job detail page, parse JSON-LD + clean HTML text
-//  4) Stop enqueuing once we reach results_wanted jobs
+// main.js
+// Playwright-based ClearedJobs.net scraper
 //
-// This avoids crawling random taxonomy / search pages and only visits:
-//  - employer-directory pages (bounded by maxDirectoryPages)
-//  - company pages
-//  - job detail pages (each yields exactly one job item)
+// - Works with search URLs like:
+//   https://clearedjobs.net/jobs?locale=en&page=1&sort=date&keywords=admin
+//
+// - Strategy:
+//   1) Open the search URL with Playwright.
+//   2) Listen to XHR/fetch responses and collect JSON that "looks like jobs".
+//   3) Map each job object to a normalized record (title, company, location, url, etc.).
+//   4) If no JSON is detected, fall back to DOM parsing of rendered job cards.
+//   5) Optionally, you can also pass direct job URLs to scrape their details.
+//
+// IMPORTANT: This script does **not** wander across directory/company pages.
+// It only touches the specific URLs you give it in `searchUrls` and `jobUrls`.
 
 import { Actor, log } from 'apify';
-import { CheerioCrawler, Dataset } from 'crawlee';
-import { load as cheerioLoad } from 'cheerio';
+import { PlaywrightCrawler, Dataset } from 'crawlee';
 
-const BASE_URL = 'https://clearedjobs.net';
-const EMPLOYER_DIRECTORY_URL = `${BASE_URL}/employer-directory`;
+const BASE = 'https://clearedjobs.net';
 
 // ---------- helpers ----------
 
@@ -23,108 +25,111 @@ function normalizeSpace(text = '') {
     return text.replace(/\s+/g, ' ').trim();
 }
 
-function safeJsonParse(raw) {
-    if (!raw) return null;
-    try {
-        return JSON.parse(raw);
-    } catch {
-        return null;
-    }
+function isJobApiUrl(url) {
+    // Heuristic: tweak this once you know the real API URL(s) from DevTools.
+    // We only consider XHR URLs that *look* like job APIs.
+    return /jobs/i.test(url) && /api/i.test(url);
 }
 
-// Grab body text without scripts/styles/noscript
-function getCleanBodyText($) {
-    const $clone = $('body').clone();
-    $clone.find('script, style, noscript, iframe').remove();
-    return normalizeSpace($clone.text() || '');
+function isJobUrl(url) {
+    return /\/job\//i.test(url);
 }
 
-// Extract JobPosting from JSON-LD
-function extractJobFromJsonLd(jsonLd) {
-    if (!jsonLd) return null;
+function isSearchUrl(url) {
+    return /\/jobs(\?|$)/i.test(url);
+}
 
-    const items = Array.isArray(jsonLd['@graph'])
-        ? jsonLd['@graph']
-        : Array.isArray(jsonLd)
-        ? jsonLd
-        : [jsonLd];
+function getJobIdKey(job) {
+    return (
+        job.id ||
+        job.jobId ||
+        job.job_id ||
+        job.slug ||
+        job.uuid ||
+        null
+    );
+}
 
-    const posting = items.find((it) => {
-        const type = it?.['@type'];
-        if (!type) return false;
-        if (Array.isArray(type)) return type.includes('JobPosting');
-        return type === 'JobPosting';
-    });
+function mapJobJsonToItem(job) {
+    // This is intentionally defensive & generic – adjust to match your real JSON structure.
+    const title =
+        job.title ||
+        job.jobTitle ||
+        job.position ||
+        job.name ||
+        null;
 
-    if (!posting) return null;
+    const company =
+        job.company?.name ||
+        job.company_name ||
+        job.employer ||
+        job.organization ||
+        null;
+
+    const location =
+        job.location ||
+        job.city_state ||
+        job.city ||
+        job.city_state_country ||
+        null;
+
+    const url =
+        job.url ||
+        job.link ||
+        (job.slug ? `${BASE}/job/${job.slug}` : null);
+
+    const descriptionHtml =
+        job.description ||
+        job.shortDescription ||
+        job.summary ||
+        null;
+
+    const descriptionText = descriptionHtml
+        ? normalizeSpace(
+              String(descriptionHtml).replace(/<\/?[^>]+(>|$)/g, ' ')
+          )
+        : null;
+
+    const datePosted =
+        job.datePosted ||
+        job.posted_at ||
+        job.postedDate ||
+        job.posted ||
+        null;
+
+    const clearance =
+        job.security_clearance ||
+        job.clearance ||
+        job.requiredClearance ||
+        null;
 
     return {
-        title: posting.title || posting.name || null,
-        description_html: posting.description || null,
-        description_text: posting.description
-            ? normalizeSpace(
-                  String(posting.description).replace(/<\/?[^>]+(>|$)/g, ' ')
-              )
-            : null,
-        company: posting.hiringOrganization?.name || null,
-        url: posting.url || posting.directApplyUrl || null,
-        location: posting.jobLocation?.address?.addressLocality
-            ? normalizeSpace(
-                  [
-                      posting.jobLocation.address.addressLocality,
-                      posting.jobLocation.address.addressRegion,
-                      posting.jobLocation.address.addressCountry,
-                  ]
-                      .filter(Boolean)
-                      .join(', ')
-              )
-            : null,
-        datePosted: posting.datePosted || null,
-        validThrough: posting.validThrough || null,
-        employmentType: posting.employmentType || null,
-        baseSalary: posting.baseSalary || null,
+        source: 'xhr',
+        title,
+        company,
+        location,
+        url,
+        description_html: descriptionHtml,
+        description_text: descriptionText,
+        date_posted: datePosted,
+        security_clearance: clearance,
+        raw: job,
     };
 }
 
-// Parse fields (clearance, location, posted date, reference ID, description) from clean text
-function extractFieldsFromText(pageTextRaw) {
-    const text = pageTextRaw || '';
-
-    const clearanceMatch = text.match(
-        /Security Clearance:\s*([\s\S]*?)(?:\r?\n|\s{2,}|Location:|Posted:)/i
-    );
-    const securityClearance = clearanceMatch
-        ? normalizeSpace(clearanceMatch[1])
-        : null;
-
-    const locationMatch = text.match(
-        /Location:\s*([\s\S]*?)(?:\r?\n|\s{2,}|Relocation Assistance:|Remote\/Telework:|Description of Duties:|Posted:)/i
-    );
-    const location = locationMatch ? normalizeSpace(locationMatch[1]) : null;
-
-    const postedMatch = text.match(
-        /Posted:\s*([A-Za-z]+\s+\d{1,2},\s+\d{4})/i
-    );
-    const posted = postedMatch ? normalizeSpace(postedMatch[1]) : null;
-
-    const referenceMatch = text.match(
-        /Job Reference ID:\s*([A-Za-z0-9\-]+)/i
-    );
-    const referenceId = referenceMatch ? normalizeSpace(referenceMatch[1]) : null;
-
-    const descMatch = text.match(
-        /Description of Duties:\s*([\s\S]*?)(?:#####?\s*Job Information|Job Information\s*:|######\s*Job Information|Trending Job Titles|####\s*Job Information|##\s*Related jobs|####\s*Trending)/i
-    );
-    const descriptionText = descMatch
-        ? normalizeSpace(descMatch[1])
+function mapJobDomToItem(card, searchPageUrl) {
+    // `card` is a plain JS object we build from $$eval
+    const url = card.href
+        ? new URL(card.href, searchPageUrl).href
         : null;
 
     return {
-        location,
-        securityClearance,
-        posted,
-        referenceId,
-        descriptionText,
+        source: 'html',
+        title: normalizeSpace(card.title || ''),
+        company: normalizeSpace(card.company || ''),
+        location: normalizeSpace(card.location || ''),
+        url,
+        summary: normalizeSpace(card.summary || ''),
     };
 }
 
@@ -133,298 +138,277 @@ function extractFieldsFromText(pageTextRaw) {
 await Actor.init();
 
 async function main() {
-    try {
-        const input = (await Actor.getInput()) || {};
+    const input = (await Actor.getInput()) || {};
 
-        const {
-            keywords = '',
-            location = '',
-            clearance_level = '',
-            results_wanted: RESULTS_WANTED_RAW = 50,
-            maxDirectoryPages: MAX_DIRECTORY_PAGES_RAW = 3,
-            maxConcurrency = 5,
-            maxRequestsPerCrawl = 5000,
-            proxyConfiguration,
-        } = input;
+    const {
+        // Search URLs that load jobs via AJAX
+        searchUrls = [
+            // Example:
+            // "https://clearedjobs.net/jobs?locale=en&page=1&sort=date&keywords=admin"
+        ],
 
-        const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW)
-            ? Math.max(1, +RESULTS_WANTED_RAW)
-            : 50;
+        // Optional: direct job URLs to scrape individually (from previous runs, etc.)
+        jobUrls = [],
 
-        const MAX_DIRECTORY_PAGES = Number.isFinite(+MAX_DIRECTORY_PAGES_RAW)
-            ? Math.max(1, +MAX_DIRECTORY_PAGES_RAW)
-            : 3;
+        // Hard cap on number of jobs to save
+        results_wanted: RESULTS_WANTED_RAW = 50,
 
-        log.info('Actor input', {
-            keywords,
-            location,
-            clearance_level,
-            RESULTS_WANTED,
-            MAX_DIRECTORY_PAGES,
-            maxConcurrency,
-            maxRequestsPerCrawl,
-        });
+        // Wait (ms) after "networkidle" to let XHRs finish
+        xhrWaitMillis = 3000,
 
-        const requestQueue = await Actor.openRequestQueue();
-        const dataset = await Dataset.open();
-        const proxyConf = proxyConfiguration
-            ? await Actor.createProxyConfiguration(proxyConfiguration)
-            : null;
+        // Standard Apify proxyConfiguration input
+        proxyConfiguration,
+    } = input;
 
-        // Seed: employer directory (page 1)
-        await requestQueue.addRequest({
-            url: EMPLOYER_DIRECTORY_URL,
-            uniqueKey: 'employer-directory-1',
-            userData: {
-                label: 'EMPLOYER_DIRECTORY',
-                pageNum: 1,
+    const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW)
+        ? Math.max(1, +RESULTS_WANTED_RAW)
+        : 50;
+
+    log.info('Actor input', {
+        results_wanted: RESULTS_WANTED,
+        searchUrlsCount: searchUrls.length,
+        jobUrlsCount: jobUrls.length,
+    });
+
+    const dataset = await Dataset.open();
+    const proxyConf = proxyConfiguration
+        ? await Actor.createProxyConfiguration(proxyConfiguration)
+        : null;
+
+    let saved = 0;
+    const seenJobKeys = new Set();
+
+    const crawler = new PlaywrightCrawler({
+        proxyConfiguration: proxyConf,
+        maxConcurrency: 2, // one or two pages at a time is enough
+        launchContext: {
+            launchOptions: {
+                headless: true,
             },
-        });
+        },
 
-        let saved = 0;
-        const seenJobUrls = new Set();
+        async requestHandler({ page, request, log }) {
+            if (saved >= RESULTS_WANTED) {
+                log.info(
+                    `Already have ${saved} jobs (>= results_wanted). Skipping ${request.url}.`
+                );
+                return;
+            }
 
-        const crawler = new CheerioCrawler({
-            requestQueue,
-            proxyConfiguration: proxyConf,
-            maxConcurrency: maxConcurrency || 5,
-            maxRequestsPerCrawl: maxRequestsPerCrawl || 5000,
-            requestHandlerTimeoutSecs: 60,
+            const url = request.url();
+            log.info(`Opening: ${url}`);
 
-            async requestHandler(context) {
-                const { request, body } = context;
-                const label = request.userData.label;
-                const url = request.loadedUrl || request.url;
+            // -----------------------
+            // Case 1: Search URL
+            // -----------------------
+            if (isSearchUrl(url)) {
+                const jobsFromXhr = [];
+                const jobKeysFromXhr = new Set();
 
-                if (!body || !url) return;
+                // Attach response listener BEFORE navigation
+                page.on('response', async (response) => {
+                    try {
+                        const resUrl = response.url();
+                        const type = response.request().resourceType();
 
-                // If we already have enough jobs, stop accepting new data
-                if (saved >= RESULTS_WANTED) {
-                    log.info(
-                        `Already saved ${saved} jobs (>= results_wanted). No further processing needed.`
-                    );
-                    return;
-                }
+                        if (!['xhr', 'fetch'].includes(type)) return;
+                        if (!isJobApiUrl(resUrl)) return;
 
-                const $ = cheerioLoad(body);
-
-                if (label === 'EMPLOYER_DIRECTORY') {
-                    const pageNum =
-                        request.userData.pageNum ??
-                        (() => {
-                            const u = new URL(url);
-                            const p = u.searchParams.get('page');
-                            return p ? Number(p) || 1 : 1;
-                        })();
-
-                    if (pageNum > MAX_DIRECTORY_PAGES) {
-                        log.info(
-                            `Skipping employer directory page ${pageNum} (beyond maxDirectoryPages=${MAX_DIRECTORY_PAGES}).`
-                        );
-                        return;
-                    }
-
-                    log.info(`EMPLOYER_DIRECTORY page ${pageNum}: ${url}`);
-
-                    // 1) Enqueue company pages
-                    $('a[href*="/company/"]').each((_, el) => {
-                        if (saved >= RESULTS_WANTED) return;
-
-                        const href = $(el).attr('href');
-                        if (!href) return;
-
-                        const absolute = new URL(href, url).href;
-
-                        // Only real company pages, e.g. /company/axiologic-solutions-325979
-                        if (!/\/company\/[a-z0-9\-]+-\d+/i.test(absolute)) return;
-
-                        requestQueue
-                            .addRequest({
-                                url: absolute,
-                                userData: { label: 'COMPANY' },
-                                uniqueKey: absolute.replace(/[#?].*$/, ''),
-                            })
-                            .catch(() => {});
-                    });
-
-                    // 2) Enqueue next directory pages (limited by MAX_DIRECTORY_PAGES)
-                    $('a[href*="employer-directory"]').each((_, el) => {
-                        const href = $(el).attr('href');
-                        if (!href) return;
-                        if (!/employer-directory.*page=/i.test(href)) return;
-
-                        const absolute = new URL(href, url).href;
-                        const u = new URL(absolute);
-                        const pStr = u.searchParams.get('page');
-                        const p = pStr ? Number(pStr) || 1 : 1;
-
-                        if (p <= MAX_DIRECTORY_PAGES) {
-                            requestQueue
-                                .addRequest({
-                                    url: absolute,
-                                    userData: { label: 'EMPLOYER_DIRECTORY', pageNum: p },
-                                    uniqueKey: `employer-directory-${p}`,
-                                })
-                                .catch(() => {});
+                        // Try JSON
+                        let json;
+                        try {
+                            json = await response.json();
+                        } catch {
+                            return;
                         }
-                    });
+                        if (!json) return;
+
+                        let candidates = [];
+                        if (Array.isArray(json.data)) candidates = json.data;
+                        else if (Array.isArray(json.jobs)) candidates = json.jobs;
+                        else if (Array.isArray(json.results)) candidates = json.results;
+                        else if (Array.isArray(json)) candidates = json;
+                        else if (json.items && Array.isArray(json.items))
+                            candidates = json.items;
+
+                        for (const job of candidates) {
+                            const key = getJobIdKey(job) || job.url || job.slug;
+                            if (!key || jobKeysFromXhr.has(key)) continue;
+                            jobKeysFromXhr.add(key);
+                            jobsFromXhr.push(job);
+                        }
+                    } catch {
+                        // Ignore parsing failures
+                    }
+                });
+
+                await page.goto(url, {
+                    waitUntil: 'networkidle',
+                });
+
+                // Give XHR a bit more time
+                await page.waitForTimeout(xhrWaitMillis);
+
+                // If XHR gave us jobs, use them
+                if (jobsFromXhr.length) {
+                    log.info(
+                        `Captured ${jobsFromXhr.length} job objects from XHR on ${url}`
+                    );
+
+                    for (const job of jobsFromXhr) {
+                        if (saved >= RESULTS_WANTED) break;
+
+                        const key = getJobIdKey(job) || job.url || job.slug;
+                        if (key && seenJobKeys.has(key)) continue;
+                        if (key) seenJobKeys.add(key);
+
+                        const item = mapJobJsonToItem(job);
+                        await dataset.pushData(item);
+                        saved += 1;
+                        log.info(
+                            `Saved job #${saved} from XHR: ${item.title || '(no title)'}`
+                        );
+                    }
 
                     return;
                 }
 
-                if (label === 'COMPANY') {
-                    log.info(`COMPANY: ${url}`);
+                // -----------------------
+                // DOM fallback: job cards
+                // -----------------------
+                log.info(
+                    `No recognizable XHR jobs found on ${url}, falling back to DOM parsing.`
+                );
 
-                    // On company pages, job links look like <a href="/job/...">Job Title</a>
-                    $('a[href*="/job/"]').each((_, el) => {
-                        if (saved >= RESULTS_WANTED) return;
-
-                        const href = $(el).attr('href');
-                        if (!href) return;
-                        const absolute = new URL(href, url).href;
-
-                        if (!/\/job\//i.test(absolute)) return;
-
-                        if (seenJobUrls.has(absolute)) return;
-                        seenJobUrls.add(absolute);
-
-                        requestQueue
-                            .addRequest({
-                                url: absolute,
-                                userData: { label: 'JOB' },
-                                uniqueKey: absolute.replace(/[#?].*$/, ''),
-                            })
-                            .catch(() => {});
+                try {
+                    // Wait for job list to appear (tweak selector as needed)
+                    // This is a generic guess; adjust selector once you inspect the page.
+                    await page.waitForSelector('a[href*="/job/"]', {
+                        timeout: 10000,
                     });
-
-                    // IMPORTANT: we do NOT follow "View All Jobs" or any other search/taxonomy links
-                    // here to keep the crawl tight and focused on actual job detail pages.
-                    return;
+                } catch {
+                    log.warning(`No job links visible on ${url} within timeout.`);
                 }
 
-                if (label === 'JOB') {
-                    if (saved >= RESULTS_WANTED) return;
+                const cards = await page.$$eval('a[href*="/job/"]', (links) =>
+                    links.map((a) => {
+                        const card = a.closest('article, li, div') || a;
+                        return {
+                            href: a.getAttribute('href') || '',
+                            title: (card.querySelector('h2,h3') || a).textContent || '',
+                            company:
+                                (card.querySelector('.company, .employer') || {}).textContent ||
+                                '',
+                            location:
+                                (card.querySelector('.location') || {}).textContent || '',
+                            summary:
+                                (card.querySelector('.description, .summary') || {})
+                                    .textContent || '',
+                        };
+                    })
+                );
 
-                    log.info(`JOB: ${url}`);
+                log.info(`Found ${cards.length} job link cards from DOM on ${url}.`);
 
-                    const $body = cheerioLoad(body);
+                for (const card of cards) {
+                    if (saved >= RESULTS_WANTED) break;
 
-                    // 1) JSON-LD (preferred for title, description, company, etc.)
-                    let jobFromLd = null;
-                    $body('script[type="application/ld+json"]').each((_, el) => {
-                        if (jobFromLd) return;
-                        const raw = $body(el).contents().text();
-                        const parsed = safeJsonParse(raw);
-                        const j = extractJobFromJsonLd(parsed);
-                        if (j) jobFromLd = j;
-                    });
-
-                    // 2) Clean text for field extraction, without JS/CSS
-                    const textAll = getCleanBodyText($body);
-                    const fields = extractFieldsFromText(textAll);
-
-                    // 3) Header extraction (<h1>, nearby company/location)
-                    const h1Text = normalizeSpace($body('h1').first().text() || '');
-                    const headerContainer = $body('h1').first().parent();
-                    const headerLinks = headerContainer.find('a');
-
-                    const companyFromHeader = normalizeSpace(
-                        headerLinks.eq(0).text() || ''
-                    );
-                    const locFromHeader = normalizeSpace(
-                        headerLinks.eq(1).text() || ''
-                    );
-
-                    const titleFinal =
-                        jobFromLd?.title ||
-                        h1Text ||
-                        null;
-
-                    const companyFinal =
-                        jobFromLd?.company ||
-                        companyFromHeader ||
-                        null;
-
-                    const locationFinal =
-                        jobFromLd?.location ||
-                        fields.location ||
-                        (locFromHeader || null);
-
-                    const descriptionTextFinal =
-                        jobFromLd?.description_text ||
-                        fields.descriptionText ||
-                        textAll ||
-                        null;
-
-                    const item = {
-                        source: 'html',
-                        url,
-                        title: titleFinal,
-                        company: companyFinal,
-                        location: locationFinal,
-                        description_text: descriptionTextFinal,
-                        description_html: jobFromLd?.description_html || null,
-                        security_clearance:
-                            jobFromLd?.securityClearance ||
-                            fields.securityClearance ||
-                            null,
-                        posted_at: fields.posted || jobFromLd?.datePosted || null,
-                        job_reference_id: fields.referenceId || null,
-                    };
-
-                    // Simple client-side filters (only if user actually provided them)
-                    if (
-                        keywords &&
-                        !String(item.title || '')
-                            .toLowerCase()
-                            .includes(String(keywords).toLowerCase())
-                    ) {
-                        return;
-                    }
-
-                    if (
-                        location &&
-                        !String(item.location || '')
-                            .toLowerCase()
-                            .includes(String(location).toLowerCase())
-                    ) {
-                        return;
-                    }
-
-                    if (
-                        clearance_level &&
-                        !String(item.security_clearance || '')
-                            .toLowerCase()
-                            .includes(String(clearance_level).toLowerCase())
-                    ) {
-                        return;
-                    }
+                    const item = mapJobDomToItem(card, url);
+                    const key = item.url || item.title + '|' + item.company;
+                    if (key && seenJobKeys.has(key)) continue;
+                    if (key) seenJobKeys.add(key);
 
                     await dataset.pushData(item);
                     saved += 1;
-                    log.info(`Saved job #${saved}: ${item.title || '(no title)'}`);
-
-                    return;
+                    log.info(
+                        `Saved job #${saved} from DOM: ${item.title || '(no title)'}`
+                    );
                 }
-            },
 
-            failedRequestHandler({ request, error }) {
-                log.error(
-                    `Request ${request.url} failed too many times: ${
-                        error?.message || error
-                    }`
+                return;
+            }
+
+            // -----------------------
+            // Case 2: Direct job URL (optional)
+            // If you pass jobUrls, you can implement detail scraping here.
+            // -----------------------
+            if (isJobUrl(url)) {
+                // Here we just grab title/company/location, no fancy XHR.
+                await page.goto(url, { waitUntil: 'domcontentloaded' });
+
+                const title = normalizeSpace(
+                    (await page.textContent('h1').catch(() => '')) || ''
                 );
-            },
-        });
 
-        await crawler.run();
+                const company = normalizeSpace(
+                    (await page.textContent('.company, .employer').catch(() => '')) ||
+                        ''
+                );
 
-        log.info(
-            `HTML crawl finished. Saved ${saved} jobs (requested up to ${RESULTS_WANTED}).`
-        );
-    } finally {
-        await Actor.exit();
+                const location = normalizeSpace(
+                    (await page.textContent('.location').catch(() => '')) || ''
+                );
+
+                const descriptionText = normalizeSpace(
+                    (await page.textContent('main, .job-description').catch(() => '')) ||
+                        ''
+                );
+
+                const item = {
+                    source: 'html-job',
+                    url,
+                    title,
+                    company,
+                    location,
+                    description_text: descriptionText || null,
+                };
+
+                const key = url;
+                if (!seenJobKeys.has(key) && saved < RESULTS_WANTED) {
+                    seenJobKeys.add(key);
+                    await dataset.pushData(item);
+                    saved += 1;
+                    log.info(
+                        `Saved job #${saved} from direct job URL: ${
+                            item.title || '(no title)'
+                        }`
+                    );
+                }
+
+                return;
+            }
+
+            log.info(`URL ${url} is neither search nor job URL; skipping.`);
+        },
+    });
+
+    const startRequests = [];
+
+    for (const u of searchUrls) {
+        if (!u) continue;
+        const url = typeof u === 'string' ? u : u.url || '';
+        if (!url) continue;
+        startRequests.push({ url });
     }
+
+    for (const u of jobUrls) {
+        if (!u) continue;
+        const url = typeof u === 'string' ? u : u.url || '';
+        if (!url) continue;
+        startRequests.push({ url });
+    }
+
+    if (!startRequests.length) {
+        log.warning(
+            'No searchUrls or jobUrls provided. Provide at least one search URL for this actor to be useful.'
+        );
+    } else {
+        await crawler.run(startRequests);
+    }
+
+    log.info(`Done. Saved ${saved} jobs (results_wanted=${RESULTS_WANTED}).`);
+
+    await Actor.exit();
 }
 
 main().catch((err) => {
