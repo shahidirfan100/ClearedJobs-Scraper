@@ -1,0 +1,70 @@
+{
+  "title": "ClearedJobs.Net Scraper",
+  "description": "Extract security-cleared job listings from ClearedJobs.net. Filter by keywords, location, clearance level, and more. Supports API-first extraction with HTML fallback.",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "startUrl": {
+      "title": "Start URL",
+      "type": "string",
+      "description": "Start scraping from a specific ClearedJobs.net search URL. If provided, this will be used instead of search filters below.",
+      "editor": "textfield"
+    },
+    "keywords": {
+      "title": "Keywords",
+      "type": "string",
+      "description": "Job search keywords, e.g., 'Engineer', 'Analyst', 'Security', 'Intelligence'.",
+      "editor": "textfield",
+      "prefill": "engineer"
+    },
+    "location": {
+      "title": "Location",
+      "type": "string",
+      "description": "Filter jobs by location (city, state, or region). Leave empty for all locations.",
+      "editor": "textfield",
+      "prefill": ""
+    },
+    "clearance_level": {
+      "title": "Security Clearance Level",
+      "type": "string",
+      "description": "Filter by required security clearance level (e.g., 'Top Secret', 'Secret', 'TS/SCI', 'Public Trust'). Leave empty for all clearance levels.",
+      "editor": "select",
+      "enum": ["", "Top Secret", "Secret", "Top Secret / SCI", "Top Secret / SCI + Polygraph", "Public Trust", "DHS", "None"]
+    },
+    "collectDetails": {
+      "title": "Collect full job details",
+      "type": "boolean",
+      "description": "If enabled, scraper visits each job detail page to extract complete information including full description, salary, and clearance requirements.",
+      "editor": "checkbox",
+      "default": true
+    },
+    "results_wanted": {
+      "title": "Maximum number of jobs",
+      "type": "integer",
+      "description": "The maximum number of jobs to collect. Set to a reasonable number to avoid long runs.",
+      "minimum": 1,
+      "default": 20,
+      "editor": "number"
+    },
+    "max_pages": {
+      "title": "Maximum number of pages",
+      "type": "integer",
+      "description": "Safety limit on the number of search result pages to visit.",
+      "minimum": 1,
+      "editor": "number",
+      "default": 3
+    },
+    "proxyConfiguration": {
+      "title": "Proxy configuration",
+      "type": "object",
+      "description": "Use Apify Proxy to avoid rate limiting and blocking. Residential proxies recommended for best results.",
+      "editor": "proxy",
+      "default": {
+        "useApifyProxy": true,
+        "apifyProxyGroups": ["RESIDENTIAL"]
+      }
+    }
+  },
+  "required": [],
+  "additionalProperties": false
+}
