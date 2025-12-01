@@ -11,15 +11,23 @@ async function main() {
     try {
         const input = (await Actor.getInput()) || {};
         const {
-            keywords = '', location = '', clearance_level = '',
+            keywords = '',
+            location = '',
+            clearance_level = '',
             results_wanted: RESULTS_WANTED_RAW = 100,
-            max_pages: MAX_PAGES_RAW = 999, collectDetails = true, startUrl, startUrls, url, proxyConfiguration,
+            max_pages: MAX_PAGES_RAW = 20,
+            collectDetails = true,
+            startUrl,
+            startUrls = [],
+            url,
+            proxyConfiguration,
         } = input;
 
         const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW) ? Math.max(1, +RESULTS_WANTED_RAW) : Number.MAX_SAFE_INTEGER;
-        const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 999;
+        const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 20;
+        const BASE = 'https://clearedjobs.net';
 
-        const toAbs = (href, base = 'https://clearedjobs.net') => {
+        const toAbs = (href, base = BASE) => {
             try { return new URL(href, base).href; } catch { return null; }
         };
 
@@ -30,88 +38,70 @@ async function main() {
             return $.root().text().replace(/\s+/g, ' ').trim();
         };
 
-        const buildStartUrl = (kw, loc, cl, page = 1) => {
-            const u = new URL('https://clearedjobs.net/jobs');
-            
-            // Parse location string to extract components
-            let country = '', state = '', city = '', zip = '';
-            if (loc) {
-                const locStr = String(loc).trim();
-                // Try to parse common formats like "City, State", "State", "City, State, Country"
-                const parts = locStr.split(',').map(p => p.trim());
-                if (parts.length >= 2) {
-                    city = parts[0];
-                    state = parts[1];
-                    if (parts.length >= 3) country = parts[2];
-                } else if (parts.length === 1) {
-                    // Single part - could be city, state, or country
-                    if (parts[0].length === 2) {
-                        state = parts[0]; // Assume 2-letter state code
-                    } else {
-                        city = parts[0]; // Assume city name
-                    }
-                }
+        const normalize = (txt) => (txt || '').replace(/\s+/g, ' ').trim();
+        const stripLabel = (txt, re) => normalize((txt || '').replace(re, ''));
+
+        const buildStartUrl = (page = 1) => {
+            const u = new URL('/jobs', BASE);
+            if (keywords) u.searchParams.set('keywords', String(keywords).trim());
+            if (location) {
+                // Site accepts plain location as city/state/zip via city_state_zip param; include raw for flexibility.
+                u.searchParams.set('city_state_zip', String(location).trim());
+                u.searchParams.set('location', String(location).trim());
             }
-            
-            u.searchParams.set('country', country);
-            u.searchParams.set('state', state);
-            u.searchParams.set('city', city);
-            u.searchParams.set('zip', zip);
-            u.searchParams.set('keywords', String(kw || '').trim());
-            u.searchParams.set('latitude', '');
-            u.searchParams.set('longitude', '');
-            u.searchParams.set('location_autocomplete_data', '');
-            u.searchParams.set('city_state_zip', '');
-            u.searchParams.set('locale', 'en');
+            if (clearance_level) u.searchParams.set('clearance_level', String(clearance_level).trim());
             u.searchParams.set('page', String(page));
-            u.searchParams.set('sort', 'date'); // Default to date sorting
-            if (cl) u.searchParams.set('clearance_level', String(cl).trim());
+            u.searchParams.set('sort', 'date');
+            u.searchParams.set('locale', 'en');
             return u.href;
         };
 
-        const initial = [];
-        if (Array.isArray(startUrls) && startUrls.length) initial.push(...startUrls);
-        if (startUrl) initial.push(startUrl);
-        if (url) initial.push(url);
-        if (!initial.length) initial.push(buildStartUrl(keywords, location, clearance_level, 1));
+        const startList = [];
+        if (Array.isArray(startUrls)) startUrls.filter(Boolean).forEach((u) => startList.push(u));
+        if (startUrl) startList.push(startUrl);
+        if (url) startList.push(url);
+        if (!startList.length) startList.push(buildStartUrl(1));
 
         const proxyConf = proxyConfiguration ? await Actor.createProxyConfiguration({ ...proxyConfiguration }) : undefined;
 
         let saved = 0;
+        let pagesHit = 0;
+        let apiHits = 0;
+        const seenJobs = new Set();
 
-        // Try to fetch JSON API first
-        async function tryFetchJsonApi(pageUrl, proxyUrl) {
-            try {
-                // ClearedJobs might have an API endpoint - try common patterns
-                const apiPatterns = [
-                    pageUrl.replace('/jobs?', '/api/jobs?'),
-                    pageUrl.replace('/jobs?', '/jobs.json?'),
-                    pageUrl + '&format=json'
-                ];
+        async function fetchListingJson(pageUrl, proxyUrl) {
+            const urlObj = new URL(pageUrl);
+            const params = urlObj.searchParams.toString();
+            const basePath = `${urlObj.origin}${urlObj.pathname}`.replace(/\/$/, '');
+            const candidates = [
+                `${basePath}.json${params ? `?${params}` : ''}`,
+                `${basePath}/search.json${params ? `?${params}` : ''}`,
+                `${urlObj.href}${urlObj.href.includes('?') ? '&' : '?'}format=json`,
+                `${urlObj.origin}/api/jobs${params ? `?${params}` : ''}`,
+            ];
 
-                for (const apiUrl of apiPatterns) {
-                    try {
-                        const response = await gotScraping({
-                            url: apiUrl,
-                            responseType: 'json',
-                            proxyUrl,
-                            timeout: { request: 30000 },
-                            headers: {
-                                'Accept': 'application/json',
-                                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                            }
-                        });
-                        
-                        if (response.body && typeof response.body === 'object') {
-                            return response.body;
-                        }
-                    } catch (e) {
-                        // Try next pattern
-                        continue;
-                    }
+            for (const apiUrl of candidates) {
+                try {
+                    const res = await gotScraping({
+                        url: apiUrl,
+                        responseType: 'json',
+                        proxyUrl,
+                        timeout: { request: 30000 },
+                        headers: {
+                            Accept: 'application/json,text/plain,*/*',
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                            'Accept-Language': 'en-US,en;q=0.9',
+                        },
+                    });
+                    const body = res.body;
+                    const jobsArray = Array.isArray(body?.jobs) ? body.jobs
+                        : Array.isArray(body?.results) ? body.results
+                            : Array.isArray(body?.data?.jobs) ? body.data.jobs
+                                : Array.isArray(body) ? body : null;
+                    if (jobsArray?.length) return { jobs: jobsArray, raw: body };
+                } catch (e) {
+                    // Try next candidate quietly
                 }
-            } catch (e) {
-                log.debug(`JSON API fetch failed: ${e.message}`);
             }
             return null;
         }
@@ -131,37 +121,52 @@ async function main() {
                                 company: e.hiringOrganization?.name || null,
                                 date_posted: e.datePosted || null,
                                 description_html: e.description || null,
-                                location: (e.jobLocation && e.jobLocation.address && (e.jobLocation.address.addressLocality || e.jobLocation.address.addressRegion)) || null,
+                                location: e.jobLocation?.address?.addressLocality || e.jobLocation?.address?.addressRegion || null,
                                 salary: e.baseSalary?.value || e.baseSalary?.minValue || null,
                                 job_type: e.employmentType || null,
                             };
                         }
                     }
-                } catch (e) { /* ignore parsing errors */ }
+                } catch {
+                    // continue
+                }
             }
             return null;
         }
 
-        function findJobLinks($, base) {
+        function parseListingHtml($, baseUrl) {
             const links = new Set();
-            $('a[href]').each((_, a) => {
-                const href = $(a).attr('href');
-                if (!href) return;
-                // ClearedJobs patterns: /job/title-location-id
-                if (/\/job\//i.test(href) || /clearedjobs\.net\/job/i.test(href)) {
-                    const abs = toAbs(href, base);
-                    if (abs && abs.includes('/job/')) links.add(abs);
-                }
-            });
+            const selectors = [
+                'a[href*="/job/"]',
+                '[data-job-id] a[href]',
+                '.search-result a[href]',
+                '.job-title a[href]',
+            ];
+            for (const sel of selectors) {
+                $(sel).each((_, el) => {
+                    const href = $(el).attr('href');
+                    if (!href) return;
+                    const abs = toAbs(href, baseUrl);
+                    if (abs && /\/job\//i.test(abs)) links.add(abs.split('#')[0]);
+                });
+            }
             return [...links];
         }
 
-        function findNextPage($, currentPageNo) {
-            // ClearedJobs uses page parameter in URL
-            const currentUrl = new URL(initial[0]);
-            const nextPage = currentPageNo + 1;
-            currentUrl.searchParams.set('page', String(nextPage));
-            return currentUrl.href;
+        function nextPageUrl(currentUrl) {
+            try {
+                const u = new URL(currentUrl);
+                const current = Number(u.searchParams.get('page') || '1') || 1;
+                u.searchParams.set('page', String(current + 1));
+                return u.href;
+            } catch {
+                return null;
+            }
+        }
+
+        async function pushItem(item) {
+            await Dataset.pushData(item);
+            saved += 1;
         }
 
         const crawler = new CheerioCrawler({
@@ -173,125 +178,129 @@ async function main() {
             async requestHandler({ request, $, enqueueLinks, log: crawlerLog, proxyInfo }) {
                 const label = request.userData?.label || 'LIST';
                 const pageNo = request.userData?.pageNo || 1;
+                if (saved >= RESULTS_WANTED) return;
 
                 if (label === 'LIST') {
-                    // Try JSON API first
-                    const jsonData = await tryFetchJsonApi(request.url, proxyInfo?.url);
-                    
+                    pagesHit += 1;
                     let links = [];
-                    if (jsonData && jsonData.jobs && Array.isArray(jsonData.jobs)) {
-                        crawlerLog.info(`LIST ${request.url} -> found ${jsonData.jobs.length} jobs via JSON API`);
-                        // Process JSON data directly
+                    let viaApi = false;
+
+                    const jsonData = await fetchListingJson(request.url, proxyInfo?.url);
+                    if (jsonData?.jobs?.length) {
+                        viaApi = true;
+                        apiHits += 1;
+                        crawlerLog.info(`LIST ${request.url} -> ${jsonData.jobs.length} jobs via JSON API`);
+                        const mapped = jsonData.jobs.map((job) => ({
+                            url: toAbs(job.url || job.link || job.canonical_url || job.job_url || (job.slug ? `/job/${job.slug}` : null), BASE),
+                            title: job.title || job.name || null,
+                            company: job.company || job.employer || job.hiring_organization || null,
+                            location: job.location || job.city || job.state || null,
+                            security_clearance: job.clearance || job.security_clearance || null,
+                            salary: job.salary || job.compensation || null,
+                            job_type: job.job_type || job.type || null,
+                            date_posted: job.date_posted || job.posted || job.posted_at || null,
+                            description_html: job.description || null,
+                        })).filter((j) => j.url);
+
                         if (!collectDetails) {
                             const remaining = RESULTS_WANTED - saved;
-                            const jobs = jsonData.jobs.slice(0, Math.max(0, remaining));
-                            for (const job of jobs) {
-                                const item = {
-                                    title: job.title || job.name || null,
-                                    company: job.company || job.employer || null,
-                                    location: job.location || null,
-                                    security_clearance: job.clearance || job.security_clearance || null,
-                                    salary: job.salary || null,
-                                    job_type: job.job_type || job.type || null,
-                                    date_posted: job.date_posted || job.posted || null,
-                                    description_html: job.description || null,
-                                    description_text: job.description ? cleanText(job.description) : null,
-                                    url: toAbs(job.url || job.link, 'https://clearedjobs.net'),
-                                };
-                                await Dataset.pushData(item);
-                                saved++;
+                            for (const job of mapped.slice(0, remaining)) {
+                                if (seenJobs.has(job.url)) continue;
+                                seenJobs.add(job.url);
+                                await pushItem({
+                                    ...job,
+                                    description_text: job.description_html ? cleanText(job.description_html) : null,
+                                    _source: 'json',
+                                });
                             }
                         } else {
-                            // Enqueue detail pages from JSON
-                            const remaining = RESULTS_WANTED - saved;
-                            links = jsonData.jobs.slice(0, Math.max(0, remaining)).map(j => toAbs(j.url || j.link, 'https://clearedjobs.net')).filter(Boolean);
+                            links = mapped.map((j) => j.url);
                         }
                     } else {
-                        // Fallback to HTML parsing
-                        links = findJobLinks($, request.url);
-                        crawlerLog.info(`LIST ${request.url} -> found ${links.length} links via HTML`);
+                        links = parseListingHtml($, request.url);
+                        crawlerLog.info(`LIST ${request.url} -> ${links.length} links via HTML`);
                     }
 
-                    if (collectDetails && links.length > 0) {
+                    if (collectDetails && links.length) {
                         const remaining = RESULTS_WANTED - saved;
-                        const toEnqueue = links.slice(0, Math.max(0, remaining));
-                        if (toEnqueue.length) await enqueueLinks({ urls: toEnqueue, userData: { label: 'DETAIL' } });
-                    } else if (!collectDetails && links.length > 0) {
+                        const toEnqueue = links.slice(0, remaining).filter((u) => !seenJobs.has(u));
+                        toEnqueue.forEach((u) => seenJobs.add(u));
+                        if (toEnqueue.length) {
+                            await enqueueLinks({
+                                urls: toEnqueue,
+                                userData: { label: 'DETAIL' },
+                            });
+                        }
+                    } else if (!collectDetails && links.length) {
                         const remaining = RESULTS_WANTED - saved;
-                        const toPush = links.slice(0, Math.max(0, remaining));
-                        if (toPush.length) { 
-                            await Dataset.pushData(toPush.map(u => ({ url: u, _source: 'clearedjobs.net' }))); 
-                            saved += toPush.length; 
+                        const toPush = links.slice(0, remaining).filter((u) => !seenJobs.has(u));
+                        toPush.forEach((u) => seenJobs.add(u));
+                        if (toPush.length) {
+                            await Dataset.pushData(toPush.map((u) => ({ url: u, _source: viaApi ? 'json' : 'html' })));
+                            saved += toPush.length;
                         }
                     }
 
                     if (saved < RESULTS_WANTED && pageNo < MAX_PAGES) {
-                        const next = findNextPage($, pageNo);
-                        if (next) await enqueueLinks({ urls: [next], userData: { label: 'LIST', pageNo: pageNo + 1 } });
+                        const nextUrl = nextPageUrl(request.url);
+                        if (nextUrl) {
+                            await enqueueLinks({
+                                urls: [nextUrl],
+                                userData: { label: 'LIST', pageNo: pageNo + 1 },
+                            });
+                        }
                     }
                     return;
                 }
 
                 if (label === 'DETAIL') {
-                    if (saved >= RESULTS_WANTED) return;
                     try {
-                        const json = extractFromJsonLd($);
-                        const data = json || {};
-                        
-                        // ClearedJobs specific selectors
-                        if (!data.title) data.title = $('h1').first().text().trim() || $('[class*="job-title"]').first().text().trim() || null;
-                        if (!data.company) data.company = $('[class*="company"]').first().text().trim() || $('.employer').first().text().trim() || null;
-                        if (!data.location) data.location = $('[class*="location"]').first().text().replace(/Location/gi, '').trim() || null;
-                        
-                        // Security clearance - unique to ClearedJobs
-                        let security_clearance = $('*').filter((_, el) => /Security Clearance/i.test($(el).text())).first().parent().text().replace(/Security Clearance/gi, '').trim() || null;
-                        if (!security_clearance) security_clearance = $('[class*="clearance"]').first().text().trim() || null;
-                        
-                        // Salary
-                        let salary = $('*').filter((_, el) => /Salary|Compensation/i.test($(el).text())).first().text().replace(/Salary|Compensation/gi, '').trim() || null;
-                        if (!salary) salary = $('[class*="salary"]').first().text().trim() || null;
-                        
-                        // Job type
-                        let job_type = $('*').filter((_, el) => /Time Type|Job Type/i.test($(el).text())).first().text().replace(/Time Type|Job Type/gi, '').trim() || null;
-                        if (!job_type) job_type = $('[class*="job-type"]').first().text().trim() || null;
-                        
-                        // Date posted
-                        if (!data.date_posted) {
-                            data.date_posted = $('*').filter((_, el) => /Posted/i.test($(el).text())).first().text().replace(/Posted/gi, '').trim() || null;
-                        }
-                        
-                        // Description
-                        if (!data.description_html) { 
-                            const desc = $('[class*="description"]').first().length ? $('[class*="description"]').first() : $('.entry-content').first();
-                            data.description_html = desc && desc.length ? String(desc.html()).trim() : null; 
-                        }
-                        data.description_text = data.description_html ? cleanText(data.description_html) : null;
+                        const fromLd = extractFromJsonLd($) || {};
+                        const title = fromLd.title || normalize($('h1').first().text()) || normalize($('[class*="job-title"]').first().text()) || null;
+                        const company = fromLd.company || normalize($('.employer, [class*="company"]').first().text()) || null;
+                        const locationText = fromLd.location || stripLabel($('[class*="location"]').first().text(), /Location/gi) || null;
+                        const clearance = stripLabel($('*').filter((_, el) => /Security Clearance/i.test($(el).text())).first().parent().text(), /Security Clearance/gi)
+                            || normalize($('[class*="clearance"]').first().text())
+                            || fromLd.security_clearance || null;
+                        const salary = stripLabel($('*').filter((_, el) => /Salary|Compensation/i.test($(el).text())).first().text(), /Salary|Compensation/gi)
+                            || normalize($('[class*="salary"]').first().text()) || (fromLd.salary ? String(fromLd.salary) : null);
+                        const jobType = stripLabel($('*').filter((_, el) => /Time Type|Job Type/i.test($(el).text())).first().text(), /Time Type|Job Type/gi)
+                            || normalize($('[class*="job-type"]').first().text())
+                            || fromLd.job_type || null;
+                        const datePosted = fromLd.date_posted
+                            || stripLabel($('*').filter((_, el) => /Posted/i.test($(el).text())).first().text(), /Posted/gi) || null;
 
-                        const item = {
-                            title: data.title || null,
-                            company: data.company || null,
-                            location: data.location || null,
-                            security_clearance: security_clearance || null,
-                            salary: salary || data.salary || null,
-                            job_type: job_type || data.job_type || null,
-                            date_posted: data.date_posted || null,
-                            description_html: data.description_html || null,
-                            description_text: data.description_text || null,
+                        let descriptionHtml = fromLd.description_html || null;
+                        if (!descriptionHtml) {
+                            const descNode = $('[class*="description"], .entry-content, [itemprop="description"]').first();
+                            descriptionHtml = descNode.length ? String(descNode.html() || '').trim() : null;
+                        }
+
+                        await pushItem({
+                            title,
+                            company,
+                            location: locationText,
+                            security_clearance: clearance || null,
+                            salary: salary || null,
+                            job_type: jobType || null,
+                            date_posted: datePosted || null,
+                            description_html: descriptionHtml,
+                            description_text: descriptionHtml ? cleanText(descriptionHtml) : null,
                             url: request.url,
-                        };
-
-                        await Dataset.pushData(item);
-                        saved++;
-                    } catch (err) { crawlerLog.error(`DETAIL ${request.url} failed: ${err.message}`); }
+                            _source: 'detail',
+                        });
+                    } catch (err) {
+                        crawlerLog.error(`DETAIL ${request.url} failed: ${err.message}`);
+                    }
                 }
-            }
+            },
         });
 
-        await crawler.run(initial.map(u => ({ url: u, userData: { label: 'LIST', pageNo: 1 } })));
-        log.info(`Finished. Saved ${saved} items`);
+        await crawler.run(startList.map((u) => ({ url: u, userData: { label: 'LIST', pageNo: 1 } })));
+        log.info(`Finished. Saved ${saved} items. Pages: ${pagesHit}. JSON hits: ${apiHits}.`);
     } finally {
         await Actor.exit();
     }
 }
 
-main().catch(err => { console.error(err); process.exit(1); });
+main().catch((err) => { console.error(err); process.exit(1); });
