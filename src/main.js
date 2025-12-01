@@ -1,8 +1,134 @@
-// ClearedJobs.net scraper - JSON API first, clean HTML descriptions
+// ClearedJobs.net HTML-only scraper
+// Strategy:
+//  1) Start from Employer Directory (server-rendered) → /employer-directory
+//  2) For each company page, extract links to job detail pages
+//  3) On each job detail page, parse JSON-LD + clean HTML text
+//  4) Stop enqueuing once we reach results_wanted jobs
+//
+// This avoids crawling random taxonomy / search pages and only visits:
+//  - employer-directory pages (bounded by maxDirectoryPages)
+//  - company pages
+//  - job detail pages (each yields exactly one job item)
+
 import { Actor, log } from 'apify';
-import { Dataset } from 'crawlee';
+import { CheerioCrawler, Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
-import { gotScraping } from 'got-scraping';
+
+const BASE_URL = 'https://clearedjobs.net';
+const EMPLOYER_DIRECTORY_URL = `${BASE_URL}/employer-directory`;
+
+// ---------- helpers ----------
+
+function normalizeSpace(text = '') {
+    return text.replace(/\s+/g, ' ').trim();
+}
+
+function safeJsonParse(raw) {
+    if (!raw) return null;
+    try {
+        return JSON.parse(raw);
+    } catch {
+        return null;
+    }
+}
+
+// Grab body text without scripts/styles/noscript
+function getCleanBodyText($) {
+    const $clone = $('body').clone();
+    $clone.find('script, style, noscript, iframe').remove();
+    return normalizeSpace($clone.text() || '');
+}
+
+// Extract JobPosting from JSON-LD
+function extractJobFromJsonLd(jsonLd) {
+    if (!jsonLd) return null;
+
+    const items = Array.isArray(jsonLd['@graph'])
+        ? jsonLd['@graph']
+        : Array.isArray(jsonLd)
+        ? jsonLd
+        : [jsonLd];
+
+    const posting = items.find((it) => {
+        const type = it?.['@type'];
+        if (!type) return false;
+        if (Array.isArray(type)) return type.includes('JobPosting');
+        return type === 'JobPosting';
+    });
+
+    if (!posting) return null;
+
+    return {
+        title: posting.title || posting.name || null,
+        description_html: posting.description || null,
+        description_text: posting.description
+            ? normalizeSpace(
+                  String(posting.description).replace(/<\/?[^>]+(>|$)/g, ' ')
+              )
+            : null,
+        company: posting.hiringOrganization?.name || null,
+        url: posting.url || posting.directApplyUrl || null,
+        location: posting.jobLocation?.address?.addressLocality
+            ? normalizeSpace(
+                  [
+                      posting.jobLocation.address.addressLocality,
+                      posting.jobLocation.address.addressRegion,
+                      posting.jobLocation.address.addressCountry,
+                  ]
+                      .filter(Boolean)
+                      .join(', ')
+              )
+            : null,
+        datePosted: posting.datePosted || null,
+        validThrough: posting.validThrough || null,
+        employmentType: posting.employmentType || null,
+        baseSalary: posting.baseSalary || null,
+    };
+}
+
+// Parse fields (clearance, location, posted date, reference ID, description) from clean text
+function extractFieldsFromText(pageTextRaw) {
+    const text = pageTextRaw || '';
+
+    const clearanceMatch = text.match(
+        /Security Clearance:\s*([\s\S]*?)(?:\r?\n|\s{2,}|Location:|Posted:)/i
+    );
+    const securityClearance = clearanceMatch
+        ? normalizeSpace(clearanceMatch[1])
+        : null;
+
+    const locationMatch = text.match(
+        /Location:\s*([\s\S]*?)(?:\r?\n|\s{2,}|Relocation Assistance:|Remote\/Telework:|Description of Duties:|Posted:)/i
+    );
+    const location = locationMatch ? normalizeSpace(locationMatch[1]) : null;
+
+    const postedMatch = text.match(
+        /Posted:\s*([A-Za-z]+\s+\d{1,2},\s+\d{4})/i
+    );
+    const posted = postedMatch ? normalizeSpace(postedMatch[1]) : null;
+
+    const referenceMatch = text.match(
+        /Job Reference ID:\s*([A-Za-z0-9\-]+)/i
+    );
+    const referenceId = referenceMatch ? normalizeSpace(referenceMatch[1]) : null;
+
+    const descMatch = text.match(
+        /Description of Duties:\s*([\s\S]*?)(?:#####?\s*Job Information|Job Information\s*:|######\s*Job Information|Trending Job Titles|####\s*Job Information|##\s*Related jobs|####\s*Trending)/i
+    );
+    const descriptionText = descMatch
+        ? normalizeSpace(descMatch[1])
+        : null;
+
+    return {
+        location,
+        securityClearance,
+        posted,
+        referenceId,
+        descriptionText,
+    };
+}
+
+// ---------- MAIN ----------
 
 await Actor.init();
 
@@ -14,261 +140,287 @@ async function main() {
             keywords = '',
             location = '',
             clearance_level = '',
-            /**
-             * HARD LIMIT of jobs you want to save in the dataset.
-             * Set high (e.g., 1000) if you want “everything”.
-             */
-            results_wanted: RESULTS_WANTED_RAW = 200,
-
-            /**
-             * Maximum number of API pages to fetch.
-             * The API is paginated; this controls depth.
-             */
-            max_pages: MAX_PAGES_RAW = 50,
-
-            /**
-             * If true -> call /api/v1/jobs/{id} per job
-             * for full description + metadata.
-             */
-            collectDetails = true,
-
-            /**
-             * Standard Apify proxyConfiguration input.
-             * e.g. { "useApifyProxy": true, "apifyProxyGroups": ["RESIDENTIAL"] }
-             */
+            results_wanted: RESULTS_WANTED_RAW = 50,
+            maxDirectoryPages: MAX_DIRECTORY_PAGES_RAW = 3,
+            maxConcurrency = 5,
+            maxRequestsPerCrawl = 5000,
             proxyConfiguration,
         } = input;
 
         const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW)
             ? Math.max(1, +RESULTS_WANTED_RAW)
-            : Number.MAX_SAFE_INTEGER;
-
-        const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW)
-            ? Math.max(1, +MAX_PAGES_RAW)
             : 50;
 
-        const BASE = 'https://clearedjobs.net';
-        const API_LIST = `${BASE}/api/v1/jobs`;
+        const MAX_DIRECTORY_PAGES = Number.isFinite(+MAX_DIRECTORY_PAGES_RAW)
+            ? Math.max(1, +MAX_DIRECTORY_PAGES_RAW)
+            : 3;
 
-        // Proxy + HTTP client (stealthy)
+        log.info('Actor input', {
+            keywords,
+            location,
+            clearance_level,
+            RESULTS_WANTED,
+            MAX_DIRECTORY_PAGES,
+            maxConcurrency,
+            maxRequestsPerCrawl,
+        });
+
+        const requestQueue = await Actor.openRequestQueue();
+        const dataset = await Dataset.open();
         const proxyConf = proxyConfiguration
-            ? await Actor.createProxyConfiguration({ ...proxyConfiguration })
-            : undefined;
+            ? await Actor.createProxyConfiguration(proxyConfiguration)
+            : null;
 
-        const client = gotScraping.extend({
-            responseType: 'json',
-            timeout: { request: 30000 },
-            headers: {
-                Accept: 'application/json,text/plain,*/*',
-                'User-Agent':
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-                    '(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        // Seed: employer directory (page 1)
+        await requestQueue.addRequest({
+            url: EMPLOYER_DIRECTORY_URL,
+            uniqueKey: 'employer-directory-1',
+            userData: {
+                label: 'EMPLOYER_DIRECTORY',
+                pageNum: 1,
             },
         });
 
-        // Strip scripts / styles etc and return plain text
-        const cleanText = (html) => {
-            if (!html) return '';
-            const $ = cheerioLoad(html);
-            $('script, style, noscript, iframe').remove();
-            return $.root().text().replace(/\s+/g, ' ').trim();
-        };
-
-        // From the Web Scribble API "customBlockList"
-        const extractCustom = (blocks = [], labelMatch) => {
-            const match = blocks.find(
-                (b) => b && b.label && labelMatch.test(String(b.label))
-            );
-            return match?.value || null;
-        };
-
-        const buildParams = (page) => {
-            const params = new URLSearchParams();
-            params.set('page', String(page));
-
-            if (keywords && String(keywords).trim()) {
-                params.set('keywords', String(keywords).trim());
-            }
-
-            if (location && String(location).trim()) {
-                // This is how the Web Scribble job board on ClearedJobs
-                // expects the location filter in their API
-                params.set(
-                    'job_location_filter',
-                    String(location).trim().toLowerCase(),
-                );
-            }
-
-            if (clearance_level && String(clearance_level).trim()) {
-                // On this board, security clearance is modeled under "job_type"
-                params.set(
-                    'job_type_filter',
-                    String(clearance_level).trim(),
-                );
-            }
-
-            return params.toString();
-        };
-
-        const fetchListingPage = async (page) => {
-            const url = `${API_LIST}?${buildParams(page)}`;
-            log.debug(`Fetching list page ${page}: ${url}`);
-
-            const res = await client.get(url, {
-                proxyUrl: proxyConf?.newUrl(),
-            });
-
-            if (res.statusCode !== 200) {
-                throw new Error(`List ${url} -> ${res.statusCode}`);
-            }
-
-            return res.body;
-        };
-
-        const fetchDetail = async (id) => {
-            const url = `${BASE}/api/v1/jobs/${id}`;
-            log.debug(`Fetching detail: ${url}`);
-
-            const res = await client.get(url, {
-                proxyUrl: proxyConf?.newUrl(),
-            });
-
-            if (res.statusCode !== 200) {
-                throw new Error(`Detail ${url} -> ${res.statusCode}`);
-            }
-
-            return res.body?.data || {};
-        };
-
-        const seen = new Set(); // de-dup by URL
         let saved = 0;
-        let pages = 0;
+        const seenJobUrls = new Set();
 
-        let page = 1;
-        while (saved < RESULTS_WANTED && page <= MAX_PAGES) {
-            let body;
-            try {
-                body = await fetchListingPage(page);
-            } catch (err) {
-                log.warning(`Failed to fetch list page ${page}: ${err.message}`);
-                break;
-            }
+        const crawler = new CheerioCrawler({
+            requestQueue,
+            proxyConfiguration: proxyConf,
+            maxConcurrency: maxConcurrency || 5,
+            maxRequestsPerCrawl: maxRequestsPerCrawl || 5000,
+            requestHandlerTimeoutSecs: 60,
 
-            const jobs = Array.isArray(body?.data) ? body.data : [];
-            if (!jobs.length) {
-                log.warning(`Page ${page} returned no jobs, stopping pagination.`);
-                break;
-            }
+            async requestHandler(context) {
+                const { request, body } = context;
+                const label = request.userData.label;
+                const url = request.loadedUrl || request.url;
 
-            pages += 1;
-            log.info(`API page ${page} -> ${jobs.length} jobs`);
+                if (!body || !url) return;
 
-            for (const job of jobs) {
-                if (saved >= RESULTS_WANTED) break;
-
-                const url = job.url || job.link || null;
-                if (!url) {
-                    // No URL, skip – can’t resolve detail page
-                    continue;
+                // If we already have enough jobs, stop accepting new data
+                if (saved >= RESULTS_WANTED) {
+                    log.info(
+                        `Already saved ${saved} jobs (>= results_wanted). No further processing needed.`
+                    );
+                    return;
                 }
 
-                if (seen.has(url)) {
-                    continue;
-                }
-                seen.add(url);
+                const $ = cheerioLoad(body);
 
-                const clearance = extractCustom(
-                    job.customBlockList,
-                    /Security Clearance/i,
-                );
-                const posted =
-                    extractCustom(job.customBlockList, /Posted/i) ||
-                    job.posted_date ||
-                    null;
+                if (label === 'EMPLOYER_DIRECTORY') {
+                    const pageNum =
+                        request.userData.pageNum ??
+                        (() => {
+                            const u = new URL(url);
+                            const p = u.searchParams.get('page');
+                            return p ? Number(p) || 1 : 1;
+                        })();
 
-                let descriptionHtml = job.shortDescription || null;
-                let detail = {};
-
-                if (collectDetails && job.id) {
-                    try {
-                        detail = await fetchDetail(job.id);
-                        // Prefer full description from detail endpoint
-                        descriptionHtml = detail.description || descriptionHtml;
-                    } catch (err) {
-                        log.debug(
-                            `Detail fetch failed for ${url} (id=${job.id}): ${err.message}`,
+                    if (pageNum > MAX_DIRECTORY_PAGES) {
+                        log.info(
+                            `Skipping employer directory page ${pageNum} (beyond maxDirectoryPages=${MAX_DIRECTORY_PAGES}).`
                         );
+                        return;
                     }
+
+                    log.info(`EMPLOYER_DIRECTORY page ${pageNum}: ${url}`);
+
+                    // 1) Enqueue company pages
+                    $('a[href*="/company/"]').each((_, el) => {
+                        if (saved >= RESULTS_WANTED) return;
+
+                        const href = $(el).attr('href');
+                        if (!href) return;
+
+                        const absolute = new URL(href, url).href;
+
+                        // Only real company pages, e.g. /company/axiologic-solutions-325979
+                        if (!/\/company\/[a-z0-9\-]+-\d+/i.test(absolute)) return;
+
+                        requestQueue
+                            .addRequest({
+                                url: absolute,
+                                userData: { label: 'COMPANY' },
+                                uniqueKey: absolute.replace(/[#?].*$/, ''),
+                            })
+                            .catch(() => {});
+                    });
+
+                    // 2) Enqueue next directory pages (limited by MAX_DIRECTORY_PAGES)
+                    $('a[href*="employer-directory"]').each((_, el) => {
+                        const href = $(el).attr('href');
+                        if (!href) return;
+                        if (!/employer-directory.*page=/i.test(href)) return;
+
+                        const absolute = new URL(href, url).href;
+                        const u = new URL(absolute);
+                        const pStr = u.searchParams.get('page');
+                        const p = pStr ? Number(pStr) || 1 : 1;
+
+                        if (p <= MAX_DIRECTORY_PAGES) {
+                            requestQueue
+                                .addRequest({
+                                    url: absolute,
+                                    userData: { label: 'EMPLOYER_DIRECTORY', pageNum: p },
+                                    uniqueKey: `employer-directory-${p}`,
+                                })
+                                .catch(() => {});
+                        }
+                    });
+
+                    return;
                 }
 
-                const item = {
-                    // Clean, correct title
-                    title: detail.title || job.title || null,
+                if (label === 'COMPANY') {
+                    log.info(`COMPANY: ${url}`);
 
-                    company:
-                        detail.company?.name ||
-                        job.company?.name ||
-                        job.company_name ||
-                        null,
+                    // On company pages, job links look like <a href="/job/...">Job Title</a>
+                    $('a[href*="/job/"]').each((_, el) => {
+                        if (saved >= RESULTS_WANTED) return;
 
-                    location:
-                        detail.location ||
-                        job.location ||
-                        extractCustom(detail.customBlockList, /Location/i) ||
-                        extractCustom(job.customBlockList, /Location/i) ||
-                        null,
+                        const href = $(el).attr('href');
+                        if (!href) return;
+                        const absolute = new URL(href, url).href;
 
-                    security_clearance:
-                        clearance ||
-                        extractCustom(detail.customBlockList, /Security Clearance/i) ||
-                        null,
+                        if (!/\/job\//i.test(absolute)) return;
 
-                    salary:
-                        extractCustom(detail.customBlockList, /Salary/i) ||
-                        extractCustom(job.customBlockList, /Salary/i) ||
-                        null,
+                        if (seenJobUrls.has(absolute)) return;
+                        seenJobUrls.add(absolute);
 
-                    job_type:
-                        extractCustom(detail.customBlockList, /(Job Type|Time Type)/i) ||
-                        extractCustom(job.customBlockList, /(Job Type|Time Type)/i) ||
-                        null,
+                        requestQueue
+                            .addRequest({
+                                url: absolute,
+                                userData: { label: 'JOB' },
+                                uniqueKey: absolute.replace(/[#?].*$/, ''),
+                            })
+                            .catch(() => {});
+                    });
 
-                    date_posted:
-                        posted ||
-                        detail.posted_date ||
-                        null,
+                    // IMPORTANT: we do NOT follow "View All Jobs" or any other search/taxonomy links
+                    // here to keep the crawl tight and focused on actual job detail pages.
+                    return;
+                }
 
-                    // Raw HTML + cleaned text
-                    description_html: descriptionHtml || null,
-                    description_text: descriptionHtml
-                        ? cleanText(descriptionHtml)
-                        : null,
+                if (label === 'JOB') {
+                    if (saved >= RESULTS_WANTED) return;
 
-                    url,
-                    job_id: job.id ?? null,
+                    log.info(`JOB: ${url}`);
 
-                    // for debugging / future enrichment
-                    _source: 'api',
-                    _raw_listing: job,
-                    _raw_detail: detail,
-                };
+                    const $body = cheerioLoad(body);
 
-                await Dataset.pushData(item);
-                saved += 1;
-            }
+                    // 1) JSON-LD (preferred for title, description, company, etc.)
+                    let jobFromLd = null;
+                    $body('script[type="application/ld+json"]').each((_, el) => {
+                        if (jobFromLd) return;
+                        const raw = $body(el).contents().text();
+                        const parsed = safeJsonParse(raw);
+                        const j = extractJobFromJsonLd(parsed);
+                        if (j) jobFromLd = j;
+                    });
 
-            const hasNext = body?.links?.next;
-            if (!hasNext) {
-                log.info('No "next" link in API response; stopping pagination.');
-                break;
-            }
+                    // 2) Clean text for field extraction, without JS/CSS
+                    const textAll = getCleanBodyText($body);
+                    const fields = extractFieldsFromText(textAll);
 
-            page += 1;
-        }
+                    // 3) Header extraction (<h1>, nearby company/location)
+                    const h1Text = normalizeSpace($body('h1').first().text() || '');
+                    const headerContainer = $body('h1').first().parent();
+                    const headerLinks = headerContainer.find('a');
+
+                    const companyFromHeader = normalizeSpace(
+                        headerLinks.eq(0).text() || ''
+                    );
+                    const locFromHeader = normalizeSpace(
+                        headerLinks.eq(1).text() || ''
+                    );
+
+                    const titleFinal =
+                        jobFromLd?.title ||
+                        h1Text ||
+                        null;
+
+                    const companyFinal =
+                        jobFromLd?.company ||
+                        companyFromHeader ||
+                        null;
+
+                    const locationFinal =
+                        jobFromLd?.location ||
+                        fields.location ||
+                        (locFromHeader || null);
+
+                    const descriptionTextFinal =
+                        jobFromLd?.description_text ||
+                        fields.descriptionText ||
+                        textAll ||
+                        null;
+
+                    const item = {
+                        source: 'html',
+                        url,
+                        title: titleFinal,
+                        company: companyFinal,
+                        location: locationFinal,
+                        description_text: descriptionTextFinal,
+                        description_html: jobFromLd?.description_html || null,
+                        security_clearance:
+                            jobFromLd?.securityClearance ||
+                            fields.securityClearance ||
+                            null,
+                        posted_at: fields.posted || jobFromLd?.datePosted || null,
+                        job_reference_id: fields.referenceId || null,
+                    };
+
+                    // Simple client-side filters (only if user actually provided them)
+                    if (
+                        keywords &&
+                        !String(item.title || '')
+                            .toLowerCase()
+                            .includes(String(keywords).toLowerCase())
+                    ) {
+                        return;
+                    }
+
+                    if (
+                        location &&
+                        !String(item.location || '')
+                            .toLowerCase()
+                            .includes(String(location).toLowerCase())
+                    ) {
+                        return;
+                    }
+
+                    if (
+                        clearance_level &&
+                        !String(item.security_clearance || '')
+                            .toLowerCase()
+                            .includes(String(clearance_level).toLowerCase())
+                    ) {
+                        return;
+                    }
+
+                    await dataset.pushData(item);
+                    saved += 1;
+                    log.info(`Saved job #${saved}: ${item.title || '(no title)'}`);
+
+                    return;
+                }
+            },
+
+            failedRequestHandler({ request, error }) {
+                log.error(
+                    `Request ${request.url} failed too many times: ${
+                        error?.message || error
+                    }`
+                );
+            },
+        });
+
+        await crawler.run();
 
         log.info(
-            `Finished. Saved ${saved} jobs from ${pages} API page(s). ` +
-                `Requested up to ${RESULTS_WANTED} jobs and ${MAX_PAGES} page(s).`,
+            `HTML crawl finished. Saved ${saved} jobs (requested up to ${RESULTS_WANTED}).`
         );
     } finally {
         await Actor.exit();
