@@ -46,6 +46,15 @@ async function main() {
         let saved = 0;
         let pages = 0;
 
+        log.info(`Starting run`, {
+            keywords,
+            location,
+            clearance_level,
+            results_wanted: RESULTS_WANTED,
+            max_pages: MAX_PAGES,
+            collectDetails,
+        });
+
         const buildParams = (page) => {
             const params = new URLSearchParams();
             params.set('page', String(page));
@@ -136,6 +145,9 @@ async function main() {
             page += 1;
         }
 
+        if (saved === 0) {
+            log.warning('Finished with 0 items. Check filters or endpoint availability.');
+        }
         log.info(`Finished. Saved ${saved} items from ${pages} pages.`);
     } finally {
         await Actor.exit();
