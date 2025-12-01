@@ -4,8 +4,10 @@
 //  2) HTML discovery via Employer Directory -> Company pages -> Job detail pages
 //  3) Robust text parsing of job detail (with optional JSON-LD extraction)
 //
-// The goal is to ALWAYS return jobs (via HTML) even if JSON endpoints are missing
-// or change, and to be polite and relatively stealthy (low concurrency, retries, backoff).
+// This version FIXES:
+//  - JS code and JSON-LD blobs leaking into description_text
+//  - Title being inferred from noisy full-page text
+//  - Now the title is taken from JSON-LD or <h1> ONLY.
 
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
@@ -27,6 +29,14 @@ function safeJsonParse(raw) {
     } catch (e) {
         return null;
     }
+}
+
+// Get BODY text without scripts/styles/noscript so we don't see navbar JS etc.
+function getCleanBodyText($) {
+    const $clone = $('body').clone();
+    $clone.find('script, style, noscript').remove();
+    const txt = $clone.text() || '';
+    return normalizeSpace(txt);
 }
 
 // Extract JobPosting objects from generic JSON-LD blocks
@@ -78,18 +88,9 @@ function extractJobFromJsonLd(jsonLd) {
     return out;
 }
 
-// Parse key fields from raw page text (pure text fallback)
+// Parse key fields from cleaned page text (pure text fallback)
 function extractFieldsFromText(pageTextRaw) {
     const text = pageTextRaw || '';
-    const oneLine = normalizeSpace(text);
-
-    // Title heuristic: best effort; we also fall back to <h1>
-    const titleMatch = oneLine.match(
-        /^([^#]*#\s*)?(.+?)\s+(Amentum|Leidos|Booz Allen|Akima|SAIC|CACI|Northrop|Lockheed|General Dynamics|BlueHalo|KBR|Apex Systems)\b/i,
-    );
-    const title =
-        (titleMatch && titleMatch[2]) ||
-        null;
 
     const clearanceMatch = text.match(/Security Clearance:\s*([\s\S]*?)(?:\r?\n|\s{2,}|Location:|Posted:)/i);
     const securityClearance = clearanceMatch
@@ -113,7 +114,6 @@ function extractFieldsFromText(pageTextRaw) {
         : null;
 
     return {
-        title,
         location,
         securityClearance,
         posted,
@@ -229,11 +229,13 @@ async function runHtmlCrawler({ keywords, location, clearance, limit, maxConcurr
         maxRequestsPerCrawl: maxRequestsPerCrawl || 5000,
         requestHandlerTimeoutSecs: 60,
         async requestHandler(context) {
-            const { request, $, body } = context;
+            const { request, body } = context;
             const label = request.userData.label;
             const url = request.loadedUrl || request.url;
 
             if (!body || !url) return;
+
+            const $ = cheerioLoad(body);
 
             if (saved >= limit) {
                 log.info(`Reached desired limit (${limit}) – aborting crawl.`);
@@ -316,7 +318,7 @@ async function runHtmlCrawler({ keywords, location, clearance, limit, maxConcurr
 
                 const $body = cheerioLoad(body);
 
-                // 1) Try JSON-LD
+                // 1) Try JSON-LD (for clean title, description, company, etc.)
                 let jobFromLd = null;
                 $body('script[type="application/ld+json"]').each((_, el) => {
                     if (jobFromLd) return;
@@ -326,40 +328,47 @@ async function runHtmlCrawler({ keywords, location, clearance, limit, maxConcurr
                     if (j) jobFromLd = j;
                 });
 
-                // 2) Fallback: heuristic text parsing
-                const textAll = $body('body').text() || $body.root().text();
+                // 2) Clean text (without script/style/noscript) for field extraction
+                const textAll = getCleanBodyText($body);
                 const fields = extractFieldsFromText(textAll);
 
                 // 3) Header extraction for title/company/location
+                const h1Text = normalizeSpace($body('h1').first().text() || '');
                 const headerContainer = $body('h1').first().parent();
                 const headerLinks = headerContainer.find('a');
 
-                const title =
-                    fields.title ||
-                    normalizeSpace($body('h1').first().text() || jobFromLd?.title || '');
-
-                const company =
-                    jobFromLd?.company ||
-                    normalizeSpace(headerLinks.eq(0).text() || '');
-
+                const companyFromHeader = normalizeSpace(headerLinks.eq(0).text() || '');
                 const locFromHeader = normalizeSpace(headerLinks.eq(1).text() || '');
+
+                // FINAL TITLE: JSON-LD title first, then <h1>, but NEVER from full body text
+                const titleFinal =
+                    jobFromLd?.title ||
+                    h1Text ||
+                    null;
+
+                const companyFinal =
+                    jobFromLd?.company ||
+                    companyFromHeader ||
+                    null;
+
                 const locationFinal =
                     jobFromLd?.location ||
                     fields.location ||
                     (locFromHeader || null);
 
-                const descriptionText =
+                const descriptionTextFinal =
                     jobFromLd?.description_text ||
                     fields.descriptionText ||
-                    normalizeSpace(textAll);
+                    textAll || // clean full body text as last resort
+                    null;
 
                 const job = {
                     source: 'html',
                     url,
-                    title: title || jobFromLd?.title || null,
-                    company: company || null,
-                    location: locationFinal || null,
-                    description_text: descriptionText || null,
+                    title: titleFinal,
+                    company: companyFinal,
+                    location: locationFinal,
+                    description_text: descriptionTextFinal,
                     description_html: jobFromLd?.description_html || null,
                     security_clearance:
                         jobFromLd?.securityClearance ||
