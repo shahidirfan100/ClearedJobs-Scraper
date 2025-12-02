@@ -59,8 +59,44 @@ function extractCsrf(html) {
     return match ? match[1] : null;
 }
 
-function mapApiJob(job, source = 'api') {
+function extractClearance(job) {
+    const blocks = job?.customBlockList || job?.customBlocklist || [];
+    const clearanceBlock = blocks.find(
+        (b) =>
+            normalizeSpace(b?.label || '').toLowerCase() === 'security clearance' ||
+            normalizeSpace(b?.title || '').toLowerCase() === 'security clearance'
+    );
+    return clearanceBlock?.value || null;
+}
+
+function mapApiJob(job, detail = {}, additional = {}, source = 'api') {
     const url = job.url ? new URL(job.url, BASE).href : `${BASE}/job/${job.id}`;
+    const descriptionHtml =
+        detail.description ||
+        detail.body ||
+        job.description ||
+        job.body ||
+        additional.description ||
+        null;
+    const salary =
+        detail.salary ||
+        detail.salary_min ||
+        detail.salary_max ||
+        additional.salary ||
+        additional.salary_min ||
+        additional.salary_max ||
+        job.salary ||
+        job.salary_min ||
+        job.salary_max ||
+        null;
+    const clearance =
+        detail.security_clearance ||
+        additional.security_clearance ||
+        extractClearance(job) ||
+        job.job_type ||
+        job.security_clearance ||
+        null;
+
     return {
         source,
         id: job.id ?? null,
@@ -68,15 +104,21 @@ function mapApiJob(job, source = 'api') {
         title: normalizeSpace(job.title || job.job_title || ''),
         company: normalizeSpace(job.company?.name || job.company || ''),
         location: normalizeSpace(job.location || ''),
-        security_clearance: job.job_type || job.security_clearance || null,
-        salary: job.salary || job.salary_min || null,
-        job_type: job.position_type || job.positionType || null,
+        security_clearance: clearance || null,
+        salary: salary || null,
+        job_type:
+            detail.position_type ||
+            detail.positionType ||
+            job.position_type ||
+            job.positionType ||
+            detail.job_type ||
+            null,
         date_posted: job.posted_date || job.modified_time || job.created_at || null,
-        description_html: job.description || job.body || null,
-        description_text: job.shortDescription
-            ? normalizeSpace(job.shortDescription)
-            : job.description
-              ? normalizeSpace(cheerio.load(job.description).text())
+        description_html: descriptionHtml,
+        description_text: descriptionHtml
+            ? normalizeSpace(cheerio.load(descriptionHtml).text())
+            : job.shortDescription
+              ? normalizeSpace(job.shortDescription)
               : null,
     };
 }
@@ -165,6 +207,41 @@ async function collectFromApi({
         'x-csrf-token': csrfToken || '',
     };
 
+    async function fetchDetails(jobId) {
+        const results = { detail: {}, additional: {} };
+        try {
+            const res = await gotScraping({
+                url: routes.show({ job: jobId }),
+                headers,
+                throwHttpErrors: false,
+                ...clientOpts,
+            });
+            if (res.statusCode < 400) {
+                const json = safeJsonParse(res.body, {});
+                results.detail = json?.data || json || {};
+            }
+        } catch (err) {
+            log.debug?.(`Job detail fetch failed for ${jobId}: ${err.message}`);
+        }
+
+        try {
+            const res = await gotScraping({
+                url: routes.additional({ job: jobId }),
+                headers,
+                throwHttpErrors: false,
+                ...clientOpts,
+            });
+            if (res.statusCode < 400) {
+                const json = safeJsonParse(res.body, {});
+                results.additional = json?.data || json || {};
+            }
+        } catch (err) {
+            log.debug?.(`Job additional fetch failed for ${jobId}: ${err.message}`);
+        }
+
+        return results;
+    }
+
     while (saved < resultsWanted && page <= maxPages) {
         const params = { ...searchParams, page };
         let json;
@@ -219,7 +296,8 @@ async function collectFromApi({
         log.info(`API page ${page}: received ${data.length} jobs`);
         for (const job of data) {
             if (saved >= resultsWanted) break;
-            const item = mapApiJob(job, 'api');
+            const { detail, additional } = await fetchDetails(job.id);
+            const item = mapApiJob(job, detail, additional, 'api');
             const key = item.url || item.id || JSON.stringify(job);
             if (!key || seen.has(key)) continue;
             seen.add(key);
