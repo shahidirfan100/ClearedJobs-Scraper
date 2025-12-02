@@ -98,7 +98,9 @@ function extractJobType(job, detail, additional) {
 }
 
 function mapApiJob(job, detail = {}, additional = {}, source = 'api') {
-    const url = job.url ? new URL(job.url, BASE).href : `${BASE}/job/${job.id}`;
+    const rawUrl =
+        job.url || detail.url || additional.url || (job.id ? `${BASE}/job/${job.id}` : null);
+    const url = rawUrl ? new URL(rawUrl, BASE).href : null;
     const descriptionHtml =
         detail.description ||
         detail.body ||
@@ -129,7 +131,8 @@ function mapApiJob(job, detail = {}, additional = {}, source = 'api') {
     return {
         source,
         id: job.id ?? null,
-        url,
+        id: job.id ?? detail.id ?? additional.id ?? null,
+        url: url || null,
         title: normalizeSpace(job.title || job.job_title || ''),
         company: normalizeSpace(job.company?.name || job.company || ''),
         location: normalizeSpace(
@@ -324,30 +327,48 @@ async function collectFromApi({
         }
 
         log.info(`API page ${page}: received ${data.length} jobs`);
-        for (const job of data) {
-            if (saved >= resultsWanted) break;
-            const { detail, additional } = await fetchDetails(job.id);
-            const item = mapApiJob(job, detail, additional, 'api');
-            if (
-                item.url &&
-                !seen.has(item.url) &&
-                ((!item.description_html || (item.description_text || '').length < 200) || !item.job_type)
-            ) {
-                const htmlItem = await fetchJobPage(item.url, clientOpts);
-                if (htmlItem) {
-                    item.description_html = item.description_html || htmlItem.description_html;
-                    item.description_text = item.description_text || htmlItem.description_text;
-                    item.job_type = item.job_type || htmlItem.job_type || null;
-                    item.location = item.location || htmlItem.location || null;
-                    item.security_clearance =
-                        item.security_clearance || htmlItem.security_clearance || null;
-                }
+        const batch = [...data];
+        const CONCURRENCY = 6;
+        while (batch.length && saved < resultsWanted) {
+            const chunk = batch.splice(0, CONCURRENCY);
+            const results = await Promise.all(
+                chunk.map(async (job) => {
+                    const { detail, additional } = await fetchDetails(job.id);
+                    const item = mapApiJob(job, detail, additional, 'api');
+                    if (
+                        item.url &&
+                        !seen.has(item.url) &&
+                        ((!item.description_html || (item.description_text || '').length < 500) ||
+                            !item.job_type)
+                    ) {
+                        const htmlItem = await fetchJobPage(item.url, clientOpts);
+                        if (htmlItem) {
+                            const existingTextLen = (item.description_text || '').length;
+                            const htmlTextLen = (htmlItem.description_text || '').length;
+                            if (!item.description_html || htmlTextLen > existingTextLen) {
+                                item.description_html =
+                                    htmlItem.description_html || item.description_html;
+                                item.description_text =
+                                    htmlItem.description_text || item.description_text;
+                            }
+                            item.job_type = item.job_type || htmlItem.job_type || null;
+                            item.location = item.location || htmlItem.location || null;
+                            item.security_clearance =
+                                item.security_clearance || htmlItem.security_clearance || null;
+                        }
+                    }
+                    return item;
+                })
+            );
+
+            for (const item of results) {
+                if (saved >= resultsWanted) break;
+                const key = item.url || item.id || JSON.stringify(item);
+                if (!key || seen.has(key)) continue;
+                seen.add(key);
+                await dataset.pushData(item);
+                saved += 1;
             }
-            const key = item.url || item.id || JSON.stringify(job);
-            if (!key || seen.has(key)) continue;
-            seen.add(key);
-            await dataset.pushData(item);
-            saved += 1;
         }
 
         const nextLink = json?.links?.next || null;
