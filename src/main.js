@@ -338,6 +338,9 @@ async function collectFromApi({
                     item.description_html = item.description_html || htmlItem.description_html;
                     item.description_text = item.description_text || htmlItem.description_text;
                     item.job_type = item.job_type || htmlItem.job_type || null;
+                    item.location = item.location || htmlItem.location || null;
+                    item.security_clearance =
+                        item.security_clearance || htmlItem.security_clearance || null;
                 }
             }
             const key = item.url || item.id || JSON.stringify(job);
