@@ -9,6 +9,7 @@ const DEFAULT_HEADERS = {
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     accept: 'application/json, text/plain, */*',
     referer: `${BASE}/jobs`,
+    'x-requested-with': 'XMLHttpRequest',
 };
 
 function normalizeSpace(text = '') {
@@ -167,7 +168,18 @@ async function collectFromApi({
                 searchParams: params,
                 ...clientOpts,
             });
+            const contentType = res.headers['content-type'] || '';
             json = safeJsonParse(res.body);
+
+            if (!json || typeof json !== 'object') {
+                log.warning(
+                    `API non-JSON response (ct=${contentType}) page=${page}, snippet=${res.body?.slice?.(
+                        0,
+                        200
+                    ) || ''}`
+                );
+                break;
+            }
         } catch (err) {
             log.warning(`API request failed page=${page}: ${err.message}`);
             break;
@@ -179,7 +191,9 @@ async function collectFromApi({
               ? json.jobs
               : [];
         if (!data.length) {
-            log.warning(`API returned no jobs on page ${page}`);
+            log.warning(
+                `API returned no jobs on page ${page} (keys=${Object.keys(json || {}).join(',')})`
+            );
             break;
         }
 
@@ -205,19 +219,36 @@ async function collectFromApi({
 
 async function collectFromSitemaps({ resultsWanted, seen, dataset, clientOpts }) {
     let saved = 0;
-    const indexUrl = `${BASE}/sitemap_active_jobs.xml`;
-    let body;
+    const indexUrl = `${BASE}/sitemap.xml`;
+    let sitemapList = [];
     try {
         const res = await gotScraping({ url: indexUrl, headers: DEFAULT_HEADERS, ...clientOpts });
-        body = res.body;
+        sitemapList = [...res.body.matchAll(/<loc>([^<]+sitemap_[^<]+\.xml)<\/loc>/g)].map(
+            (m) => m[1]
+        );
     } catch (err) {
-        log.warning(`Failed to fetch sitemap: ${err.message}`);
+        log.warning(`Failed to fetch sitemap index: ${err.message}`);
         return saved;
     }
 
-    const urls = [...body.matchAll(/<loc>([^<]+)<\/loc>/g)]
-        .map((m) => m[1])
-        .slice(0, resultsWanted * 2);
+    const jobSitemaps = sitemapList.filter((u) => u.includes('sitemap_active_jobs'));
+    if (!jobSitemaps.length) {
+        log.warning('No job sitemaps discovered in sitemap index.');
+        return saved;
+    }
+
+    const urls = [];
+    for (const sm of jobSitemaps) {
+        if (urls.length >= resultsWanted * 2) break;
+        try {
+            const res = await gotScraping({ url: sm, headers: DEFAULT_HEADERS, ...clientOpts });
+            urls.push(
+                ...[...res.body.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]).slice(0, resultsWanted)
+            );
+        } catch (err) {
+            log.warning(`Failed to fetch sitemap ${sm}: ${err.message}`);
+        }
+    }
     log.info(`Sitemap seed URLs: ${urls.length}`);
 
     for (const url of urls) {
