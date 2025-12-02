@@ -1,6 +1,6 @@
 # ClearedJobs.Net Scraper
 
-Extract security-cleared job listings from ClearedJobs.net with advanced filtering capabilities. This scraper efficiently collects job postings requiring security clearances, making it ideal for defense contractors, government agencies, and security-cleared professionals.
+Extract security-cleared job listings from ClearedJobs.net with advanced filtering capabilities. This scraper now calls the site’s JSON API first (fast, lightweight), then falls back to HTML/JSON-LD via sitemaps if the API is empty or blocked.
 
 ## Key Features
 
@@ -11,77 +11,17 @@ Extract security-cleared job listings from ClearedJobs.net with advanced filteri
 - **Smart Pagination** - Automatically navigates through multiple pages of results
 - **Proxy Support** - Built-in support for Apify Proxy to ensure uninterrupted data collection
 
-## Input Configuration
+## Input Configuration (key fields)
 
-Configure the scraper using these parameters:
-
-### Search Filters
-
-<table>
-<thead>
-<tr>
-<th>Parameter</th>
-<th>Type</th>
-<th>Description</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><strong>keywords</strong></td>
-<td>String</td>
-<td>Job search keywords (e.g., "Software Engineer", "Intelligence Analyst", "Cyber Security")</td>
-</tr>
-<tr>
-<td><strong>location</strong></td>
-<td>String</td>
-<td>Filter jobs by location (city, state, or region). Leave empty for all locations.</td>
-</tr>
-<tr>
-<td><strong>clearance_level</strong></td>
-<td>String</td>
-<td>Filter by security clearance level ("Top Secret", "Secret", "TS/SCI", "TS/SCI + Polygraph", "Public Trust", "DHS", "None")</td>
-</tr>
-</tbody>
-</table>
-
-### Scraper Controls
-
-<table>
-<thead>
-<tr>
-<th>Parameter</th>
-<th>Type</th>
-<th>Description</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><strong>collectDetails</strong></td>
-<td>Boolean</td>
-<td>Visit individual job pages for complete details. Default: true</td>
-</tr>
-<tr>
-<td><strong>results_wanted</strong></td>
-<td>Integer</td>
-<td>Maximum number of jobs to collect. Default: 100</td>
-</tr>
-<tr>
-<td><strong>max_pages</strong></td>
-<td>Integer</td>
-<td>Safety limit on search result pages. Default: 20</td>
-</tr>
-<tr>
-<td><strong>startUrl</strong></td>
-<td>String</td>
-<td>Start from a specific ClearedJobs.net URL (bypasses search filters)</td>
-</tr>
-<tr>
-<td><strong>proxyConfiguration</strong></td>
-<td>Object</td>
-<td>Apify Proxy settings. Residential proxies recommended</td>
-</tr>
-</tbody>
-</table>
+- `keywords` (string): Query terms (e.g., “engineer”, “cyber”).
+- `location` / `city` / `state` / `zip` (string): Location filters passed to the API.
+- `remote` (string): `remote` or `hybrid` to match the site’s remote filters.
+- `sort` (string): `date` (recommended) or `relevance`.
+- `results_wanted` (int): Max jobs to save.
+- `max_pages` (int): API pagination safety cap.
+- `startUrls` (array): Direct job URLs to force-collect (skips API).
+- `searchUrl` (string, optional): Custom `/jobs?...` page to seed route discovery.
+- `proxyConfiguration` (object): Standard Apify proxy settings.
 
 ## Output Data
 
@@ -168,47 +108,28 @@ Each job listing includes the following fields:
 
 ## Usage Examples
 
-### Example 1: Search Top Secret Jobs in Virginia
+### Quick examples
 
 ```json
 {
   "keywords": "engineer",
-  "location": "Virginia",
-  "clearance_level": "Top Secret",
-  "results_wanted": 20,
-  "collectDetails": true
+  "sort": "date",
+  "results_wanted": 25,
+  "max_pages": 4,
+  "remote": "remote",
+  "proxyConfiguration": {
+    "useApifyProxy": true,
+    "apifyProxyGroups": ["RESIDENTIAL"]
+  }
 }
 ```
 
-### Example 2: Cyber Security Jobs with TS/SCI Clearance
-
 ```json
 {
-  "keywords": "cyber security",
-  "clearance_level": "Top Secret / SCI",
-  "results_wanted": 20,
-  "max_pages": 3
-}
-```
-
-### Example 3: Intelligence Analyst Jobs in Maryland
-
-```json
-{
-  "keywords": "analyst",
-  "location": "Fort Meade, Maryland",
-  "results_wanted": 20,
-  "collectDetails": true
-}
-```
-
-### Example 4: Browse All Recent Jobs
-
-```json
-{
-  "results_wanted": 20,
-  "max_pages": 3,
-  "collectDetails": false
+  "startUrls": [
+    "https://clearedjobs.net/job/senior-software-engineer-aurora-colorado-1059802"
+  ],
+  "results_wanted": 5
 }
 ```
 
