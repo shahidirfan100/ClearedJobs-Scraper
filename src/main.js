@@ -114,8 +114,15 @@ async function fetchJobPage(url, clientOpts) {
     const res = await gotScraping({
         url,
         headers: DEFAULT_HEADERS,
+        throwHttpErrors: false,
         ...clientOpts,
     });
+
+    if (res.statusCode >= 400) {
+        log.warning(`Job page blocked (${res.statusCode}) for ${url}`);
+        return null;
+    }
+
     const $ = cheerio.load(res.body);
     const ldScript = $('script[type="application/ld+json"]').first().text();
     if (ldScript) {
@@ -161,29 +168,41 @@ async function collectFromApi({
     while (saved < resultsWanted && page <= maxPages) {
         const params = { ...searchParams, page };
         let json;
-        try {
-            const res = await gotScraping({
-                url: endpoint,
-                headers,
-                searchParams: params,
-                ...clientOpts,
-            });
-            const contentType = res.headers['content-type'] || '';
-            json = safeJsonParse(res.body);
+        let attempt = 0;
+        while (attempt < 3 && !json) {
+            attempt += 1;
+            try {
+                const res = await gotScraping({
+                    url: endpoint,
+                    headers,
+                    searchParams: params,
+                    throwHttpErrors: false,
+                    ...clientOpts,
+                });
+                const contentType = res.headers['content-type'] || '';
+                if (res.statusCode >= 500) {
+                    log.warning(`API ${res.statusCode} on page ${page}, retry ${attempt}`);
+                    await Actor.sleep(1500 * attempt);
+                    continue;
+                }
+                json = safeJsonParse(res.body);
 
-            if (!json || typeof json !== 'object') {
-                log.warning(
-                    `API non-JSON response (ct=${contentType}) page=${page}, snippet=${res.body?.slice?.(
-                        0,
-                        200
-                    ) || ''}`
-                );
-                break;
+                if (!json || typeof json !== 'object') {
+                    log.warning(
+                        `API non-JSON response (ct=${contentType}) page=${page}, snippet=${res.body?.slice?.(
+                            0,
+                            200
+                        ) || ''}`
+                    );
+                    break;
+                }
+            } catch (err) {
+                log.warning(`API request failed page=${page} (attempt ${attempt}): ${err.message}`);
+                await Actor.sleep(1000 * attempt);
             }
-        } catch (err) {
-            log.warning(`API request failed page=${page}: ${err.message}`);
-            break;
         }
+
+        if (!json || typeof json !== 'object') break;
 
         const data = Array.isArray(json?.data)
             ? json.data
@@ -241,7 +260,16 @@ async function collectFromSitemaps({ resultsWanted, seen, dataset, clientOpts })
     for (const sm of jobSitemaps) {
         if (urls.length >= resultsWanted * 2) break;
         try {
-            const res = await gotScraping({ url: sm, headers: DEFAULT_HEADERS, ...clientOpts });
+            const res = await gotScraping({
+                url: sm,
+                headers: DEFAULT_HEADERS,
+                throwHttpErrors: false,
+                ...clientOpts,
+            });
+            if (res.statusCode >= 400) {
+                log.warning(`Sitemap ${sm} blocked (${res.statusCode})`);
+                continue;
+            }
             urls.push(
                 ...[...res.body.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]).slice(0, resultsWanted)
             );
@@ -256,6 +284,7 @@ async function collectFromSitemaps({ resultsWanted, seen, dataset, clientOpts })
         if (seen.has(url)) continue;
         try {
             const item = await fetchJobPage(url, clientOpts);
+            if (!item) continue;
             await dataset.pushData(item);
             seen.add(url);
             saved += 1;
@@ -303,7 +332,9 @@ log.info('Actor input', {
 });
 
 const dataset = await Dataset.open();
-const proxyConf = proxyConfiguration ? await Actor.createProxyConfiguration(proxyConfiguration) : null;
+const proxyConf = proxyConfiguration
+    ? await Actor.createProxyConfiguration(proxyConfiguration)
+    : await Actor.createProxyConfiguration({ useApifyProxy: true });
 const clientOpts = proxyConf ? { proxyUrl: await proxyConf.newUrl() } : {};
 
 const seen = new Set();

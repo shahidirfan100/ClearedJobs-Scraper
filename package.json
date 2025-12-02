@@ -3,28 +3,15 @@
   "version": "1.0.0",
   "description": "Extract security-cleared job listings from ClearedJobs.net with advanced filtering options. API-first approach with HTML fallback for reliable data extraction.",
   "type": "module",
- "dependencies": {
-        "apify": "^3.4.2",
-        "crawlee": "^3.13.8",
-        "playwright": "1.54.1",
-        "cheerio": "^1.0.0-rc.12",
-        "got-scraping": "^3.2.14"
-    },
-    "devDependencies": {
-        "@apify/eslint-config": "^1.0.0",
-        "eslint": "^9.29.0",
-        "eslint-config-prettier": "^10.1.5",
-        "prettier": "^3.5.3"
-    },
-    "scripts": {
-        "start": "node src/main.js",
-        "format": "prettier --write .",
-        "format:check": "prettier --check .",
-        "lint": "eslint",
-        "lint:fix": "eslint --fix",
-        "test": "echo \"Error: oops, the Actor has no tests yet, sad!\" && exit 1",
-        "postinstall": "npx crawlee install-playwright-browsers"
-    },
-    "author": "It's not you it's me",
-    "license": "ISC"
+  "scripts": {
+    "start": "node src/main.js"
+  },
+  "dependencies": {
+    "apify": "^3.4.5",
+    "crawlee": "^3.14.1",
+    "cheerio": "^1.0.0-rc.12",
+    "got-scraping": "^4.1.2",
+    "jsdom": "^27.1.0",
+    "header-generator": "^2.1.27"
+  }
 }
