@@ -328,11 +328,16 @@ async function collectFromApi({
             if (saved >= resultsWanted) break;
             const { detail, additional } = await fetchDetails(job.id);
             const item = mapApiJob(job, detail, additional, 'api');
-            if ((!item.description_html || !item.description_text) && item.url && !seen.has(item.url)) {
+            if (
+                item.url &&
+                !seen.has(item.url) &&
+                ((!item.description_html || (item.description_text || '').length < 200) || !item.job_type)
+            ) {
                 const htmlItem = await fetchJobPage(item.url, clientOpts);
                 if (htmlItem) {
                     item.description_html = item.description_html || htmlItem.description_html;
                     item.description_text = item.description_text || htmlItem.description_text;
+                    item.job_type = item.job_type || htmlItem.job_type || null;
                 }
             }
             const key = item.url || item.id || JSON.stringify(job);
