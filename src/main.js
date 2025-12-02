@@ -71,7 +71,12 @@ function extractFromBlocks(job, label) {
 }
 
 function extractClearance(job) {
-    return extractFromBlocks(job, 'Security Clearance');
+    return (
+        extractFromBlocks(job, 'Security Clearance') ||
+        job.security_clearance ||
+        job.job_type ||
+        null
+    );
 }
 
 function extractJobType(job, detail, additional) {
@@ -111,6 +116,7 @@ function mapApiJob(job, detail = {}, additional = {}, source = 'api') {
         job.salary ||
         job.salary_min ||
         job.salary_max ||
+        extractFromBlocks(job, 'Salary') ||
         null;
     const clearance =
         detail.security_clearance ||
@@ -126,7 +132,13 @@ function mapApiJob(job, detail = {}, additional = {}, source = 'api') {
         url,
         title: normalizeSpace(job.title || job.job_title || ''),
         company: normalizeSpace(job.company?.name || job.company || ''),
-        location: normalizeSpace(job.location || ''),
+        location: normalizeSpace(
+            job.location ||
+                detail.location ||
+                additional.location ||
+                extractFromBlocks(job, 'Location') ||
+                ''
+        ),
         security_clearance: clearance || null,
         salary: salary || null,
         job_type: extractJobType(job, detail, additional),
