@@ -67,7 +67,7 @@ function extractFromBlocks(job, label) {
             normalizeSpace(b?.label || '').toLowerCase() === target ||
             normalizeSpace(b?.title || '').toLowerCase() === target
     );
-    return block?.value || null;
+    return block?.value ? normalizeSpace(block.value) : null;
 }
 
 function extractClearance(job) {
@@ -100,7 +100,9 @@ function extractJobType(job, detail, additional) {
 function mapApiJob(job, detail = {}, additional = {}, source = 'api') {
     const rawUrl =
         job.url || detail.url || additional.url || (job.id ? `${BASE}/job/${job.id}` : null);
-    const url = rawUrl ? new URL(rawUrl, BASE).href : null;
+    const id = job.id ?? detail.id ?? additional.id ?? null;
+    let url = rawUrl ? new URL(rawUrl, BASE).href : null;
+    if (!url && id) url = `${BASE}/job/${id}`;
     const descriptionHtml =
         detail.description ||
         detail.body ||
@@ -130,8 +132,7 @@ function mapApiJob(job, detail = {}, additional = {}, source = 'api') {
 
     return {
         source,
-        id: job.id ?? null,
-        id: job.id ?? detail.id ?? additional.id ?? null,
+        id,
         url: url || null,
         title: normalizeSpace(job.title || job.job_title || ''),
         company: normalizeSpace(job.company?.name || job.company || ''),
@@ -338,8 +339,13 @@ async function collectFromApi({
                     if (
                         item.url &&
                         !seen.has(item.url) &&
-                        ((!item.description_html || (item.description_text || '').length < 500) ||
-                            !item.job_type)
+                        (
+                            (!item.description_html || (item.description_text || '').length < 500) ||
+                            !item.job_type ||
+                            !item.security_clearance ||
+                            !item.location ||
+                            !item.salary
+                        )
                     ) {
                         const htmlItem = await fetchJobPage(item.url, clientOpts);
                         if (htmlItem) {
@@ -355,6 +361,7 @@ async function collectFromApi({
                             item.location = item.location || htmlItem.location || null;
                             item.security_clearance =
                                 item.security_clearance || htmlItem.security_clearance || null;
+                            item.salary = item.salary || htmlItem.salary || null;
                         }
                     }
                     return item;
