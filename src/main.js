@@ -218,7 +218,8 @@ async function collectFromApi({
 }) {
     let saved = 0;
     let page = 1;
-    let endpoint = routes.index();
+    const indexFn = typeof routes.index === 'function' ? routes.index : () => `${BASE}/api/v1/jobs`;
+    let endpoint = indexFn();
     const headers = {
         ...DEFAULT_HEADERS,
         'x-csrf-token': csrfToken || '',
