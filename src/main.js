@@ -59,14 +59,37 @@ function extractCsrf(html) {
     return match ? match[1] : null;
 }
 
-function extractClearance(job) {
+function extractFromBlocks(job, label) {
     const blocks = job?.customBlockList || job?.customBlocklist || [];
-    const clearanceBlock = blocks.find(
+    const target = normalizeSpace(label || '').toLowerCase();
+    const block = blocks.find(
         (b) =>
-            normalizeSpace(b?.label || '').toLowerCase() === 'security clearance' ||
-            normalizeSpace(b?.title || '').toLowerCase() === 'security clearance'
+            normalizeSpace(b?.label || '').toLowerCase() === target ||
+            normalizeSpace(b?.title || '').toLowerCase() === target
     );
-    return clearanceBlock?.value || null;
+    return block?.value || null;
+}
+
+function extractClearance(job) {
+    return extractFromBlocks(job, 'Security Clearance');
+}
+
+function extractJobType(job, detail, additional) {
+    return (
+        detail.position_type ||
+        detail.positionType ||
+        detail.job_type ||
+        detail.employment_type ||
+        additional.position_type ||
+        additional.positionType ||
+        additional.job_type ||
+        additional.employment_type ||
+        job.position_type ||
+        job.positionType ||
+        job.job_type ||
+        extractFromBlocks(job, 'Job Type') ||
+        null
+    );
 }
 
 function mapApiJob(job, detail = {}, additional = {}, source = 'api') {
@@ -106,13 +129,7 @@ function mapApiJob(job, detail = {}, additional = {}, source = 'api') {
         location: normalizeSpace(job.location || ''),
         security_clearance: clearance || null,
         salary: salary || null,
-        job_type:
-            detail.position_type ||
-            detail.positionType ||
-            job.position_type ||
-            job.positionType ||
-            detail.job_type ||
-            null,
+        job_type: extractJobType(job, detail, additional),
         date_posted: job.posted_date || job.modified_time || job.created_at || null,
         description_html: descriptionHtml,
         description_text: descriptionHtml
@@ -298,6 +315,13 @@ async function collectFromApi({
             if (saved >= resultsWanted) break;
             const { detail, additional } = await fetchDetails(job.id);
             const item = mapApiJob(job, detail, additional, 'api');
+            if ((!item.description_html || !item.description_text) && item.url && !seen.has(item.url)) {
+                const htmlItem = await fetchJobPage(item.url, clientOpts);
+                if (htmlItem) {
+                    item.description_html = item.description_html || htmlItem.description_html;
+                    item.description_text = item.description_text || htmlItem.description_text;
+                }
+            }
             const key = item.url || item.id || JSON.stringify(job);
             if (!key || seen.has(key)) continue;
             seen.add(key);
