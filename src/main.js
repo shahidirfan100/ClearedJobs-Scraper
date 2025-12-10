@@ -18,6 +18,11 @@ const DEFAULT_HEADERS = {
     'sec-fetch-user': '?1',
 };
 
+// Stealth delay helper
+function randomDelay(min = 100, max = 500) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
 function normalizeSpace(text = '') {
     return text.replace(/\s+/g, ' ').trim();
 }
@@ -320,7 +325,7 @@ async function collectFromApi({
                 const contentType = res.headers['content-type'] || '';
                 if (res.statusCode >= 500) {
                     log.warning(`API HTTP ${res.statusCode} on page ${page}, retry ${attempt}`);
-                    await Actor.sleep(1500 * attempt);
+                    await Actor.sleep(800 * attempt + randomDelay(100, 300));
                     continue;
                 }
                 json = safeJsonParse(res.body);
@@ -340,7 +345,7 @@ async function collectFromApi({
                 }
                 
                 if (attempt < 3) {
-                    await Actor.sleep(1000 * attempt);
+                    await Actor.sleep(500 * attempt + randomDelay(100, 300));
                 }
             }
         }
@@ -358,7 +363,7 @@ async function collectFromApi({
         }
 
         const batch = [...data];
-        const CONCURRENCY = 6;
+        const CONCURRENCY = 12;
         while (batch.length && saved < resultsWanted) {
             const chunk = batch.splice(0, CONCURRENCY);
             const results = await Promise.all(
@@ -404,6 +409,8 @@ async function collectFromApi({
                 seen.add(key);
                 await dataset.pushData(item);
                 saved += 1;
+                // Small random delay for stealth
+                await Actor.sleep(randomDelay(50, 150));
             }
         }
 
@@ -411,6 +418,8 @@ async function collectFromApi({
         if (!nextLink) break;
         page += 1;
         endpoint = nextLink.startsWith('http') ? nextLink : endpoint;
+        // Small delay between pages for stealth
+        if (page <= maxPages) await Actor.sleep(randomDelay(200, 500));
     }
 
     return saved;
@@ -529,7 +538,7 @@ await Actor.main(async () => {
             
             if (response.statusCode === 403) {
                 log.warning(`HTTP 403 - retrying search page (attempt ${attempt}/3)...`);
-                await Actor.sleep(2000 * attempt);
+                await Actor.sleep(1000 * attempt + randomDelay(100, 400));
                 continue;
             }
             
@@ -541,7 +550,7 @@ await Actor.main(async () => {
         } catch (err) {
             if (attempt < 3) {
                 log.warning(`Failed to fetch search page (attempt ${attempt}/3): ${err.message}`);
-                await Actor.sleep(2000 * attempt);
+                await Actor.sleep(1000 * attempt + randomDelay(100, 400));
             } else {
                 throw new Error(`Unable to fetch search page after ${attempt} attempts: ${err.message}`);
             }
