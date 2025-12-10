@@ -4,6 +4,7 @@
   "max_pages": 4,
   "sort": "date",
   "remote": "remote",
+  "debugLog": false,
   "proxyConfiguration": {
     "useApifyProxy": true,
     "apifyProxyGroups": ["RESIDENTIAL"]

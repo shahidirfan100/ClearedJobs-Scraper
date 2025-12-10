@@ -186,17 +186,18 @@ function mapJsonLdJob(ld) {
 }
 
 async function fetchJobPage(url, clientOpts) {
-    const res = await gotScraping({
-        url,
-        headers: DEFAULT_HEADERS,
-        throwHttpErrors: false,
-        ...clientOpts,
-    });
+    try {
+        const res = await gotScraping({
+            url,
+            headers: DEFAULT_HEADERS,
+            throwHttpErrors: false,
+            ...clientOpts,
+        });
 
-    if (res.statusCode >= 400) {
-        log.warning(`Job page blocked (${res.statusCode}) for ${url}`);
-        return null;
-    }
+        if (res.statusCode >= 400) {
+            log.warning(`Job page blocked (${res.statusCode}) for ${url}`);
+            return null;
+        }
 
     const $ = cheerio.load(res.body);
     const ldScript = $('script[type="application/ld+json"]').first().text();
@@ -220,6 +221,10 @@ async function fetchJobPage(url, clientOpts) {
         description_html: descHtml,
         description_text: descText,
     };
+    } catch (err) {
+        log.warning(`Failed to fetch job page ${url}: ${err.message}`);
+        return null;
+    }
 }
 
 async function collectFromApi({
@@ -253,9 +258,17 @@ async function collectFromApi({
             if (res.statusCode < 400) {
                 const json = safeJsonParse(res.body, {});
                 results.detail = json?.data || json || {};
+            } else if (res.statusCode >= 500) {
+                log.debug(`Job detail HTTP ${res.statusCode} for ${jobId}`);
             }
         } catch (err) {
-            log.debug?.(`Job detail fetch failed for ${jobId}: ${err.message}`);
+            // Handle proxy/network errors gracefully
+            const errorMsg = err.message || String(err);
+            if (errorMsg.includes('ECONNRESET') || errorMsg.includes('proxy') || errorMsg.includes('595')) {
+                log.debug(`Network/proxy error fetching job detail ${jobId}`);
+            } else {
+                log.debug(`Job detail fetch failed for ${jobId}: ${errorMsg}`);
+            }
         }
 
         try {
@@ -268,9 +281,17 @@ async function collectFromApi({
             if (res.statusCode < 400) {
                 const json = safeJsonParse(res.body, {});
                 results.additional = json?.data || json || {};
+            } else if (res.statusCode >= 500) {
+                log.debug(`Job additional HTTP ${res.statusCode} for ${jobId}`);
             }
         } catch (err) {
-            log.debug?.(`Job additional fetch failed for ${jobId}: ${err.message}`);
+            // Handle proxy/network errors gracefully
+            const errorMsg = err.message || String(err);
+            if (errorMsg.includes('ECONNRESET') || errorMsg.includes('proxy') || errorMsg.includes('595')) {
+                log.debug(`Network/proxy error fetching job additional ${jobId}`);
+            } else {
+                log.debug(`Job additional fetch failed for ${jobId}: ${errorMsg}`);
+            }
         }
 
         return results;
@@ -292,24 +313,29 @@ async function collectFromApi({
                 });
                 const contentType = res.headers['content-type'] || '';
                 if (res.statusCode >= 500) {
-                    log.warning(`API ${res.statusCode} on page ${page}, retry ${attempt}`);
+                    log.warning(`API HTTP ${res.statusCode} on page ${page}, retry ${attempt}`);
                     await Actor.sleep(1500 * attempt);
                     continue;
                 }
                 json = safeJsonParse(res.body);
 
                 if (!json || typeof json !== 'object') {
-                    log.warning(
-                        `API non-JSON response (ct=${contentType}) page=${page}, snippet=${res.body?.slice?.(
-                            0,
-                            200
-                        ) || ''}`
-                    );
+                    log.warning(`API non-JSON response on page ${page}`);
+                    log.debug(`Content-Type: ${contentType}, Body snippet: ${res.body?.slice?.(0, 200) || ''}`);
                     break;
                 }
             } catch (err) {
-                log.warning(`API request failed page=${page} (attempt ${attempt}): ${err.message}`);
-                await Actor.sleep(1000 * attempt);
+                const errorMsg = err.message || String(err);
+                // Handle proxy/network errors gracefully
+                if (errorMsg.includes('ECONNRESET') || errorMsg.includes('proxy') || errorMsg.includes('595')) {
+                    log.warning(`Network/proxy error on page ${page} (attempt ${attempt}), retrying...`);
+                } else {
+                    log.warning(`API request failed page=${page} (attempt ${attempt}): ${errorMsg}`);
+                }
+                
+                if (attempt < 3) {
+                    await Actor.sleep(1000 * attempt);
+                }
             }
         }
 
@@ -321,13 +347,12 @@ async function collectFromApi({
               ? json.jobs
               : [];
         if (!data.length) {
-            log.warning(
-                `API returned no jobs on page ${page} (keys=${Object.keys(json || {}).join(',')})`
-            );
+            log.warning(`API returned no jobs on page ${page}`);
+            log.debug(`Response keys: ${Object.keys(json || {}).join(',')}`);
             break;
         }
 
-        log.info(`API page ${page}: received ${data.length} jobs`);
+        log.info(`Processing page ${page}: ${data.length} jobs`);
         const batch = [...data];
         const CONCURRENCY = 6;
         while (batch.length && saved < resultsWanted) {
@@ -375,6 +400,7 @@ async function collectFromApi({
                 seen.add(key);
                 await dataset.pushData(item);
                 saved += 1;
+                log.debug(`Saved job: ${item.title || item.id || 'unknown'}`);
             }
         }
 
@@ -439,7 +465,7 @@ async function collectFromSitemaps({ resultsWanted, seen, dataset, clientOpts })
             await dataset.pushData(item);
             seen.add(url);
             saved += 1;
-            log.info(`Saved from sitemap/html: ${item.title || url}`);
+            log.debug(`Saved from sitemap: ${item.title || url}`);
         } catch (err) {
             log.warning(`Failed to parse job ${url}: ${err.message}`);
         }
@@ -448,112 +474,152 @@ async function collectFromSitemaps({ resultsWanted, seen, dataset, clientOpts })
     return saved;
 }
 
-await Actor.init();
+await Actor.main(async () => {
+    const input = await Actor.getInput();
+    
+    // Validate input early
+    if (!input) {
+        throw new Error('INPUT cannot be empty!');
+    }
 
-const input = (await Actor.getInput()) || {};
-const {
-    keywords = '',
-    location = '',
-    city = '',
-    state = '',
-    zip = '',
-    searchUrl = '',
-    startUrls = [],
-    results_wanted: RESULTS_WANTED_RAW = 50,
-    max_pages: MAX_PAGES_RAW = 5,
-    sort = 'date',
-    remote = '',
-    proxyConfiguration,
-} = input;
+    const {
+        keywords = '',
+        location = '',
+        city = '',
+        state = '',
+        zip = '',
+        searchUrl = '',
+        startUrls = [],
+        results_wanted: RESULTS_WANTED_RAW = 50,
+        max_pages: MAX_PAGES_RAW = 5,
+        sort = 'date',
+        remote = '',
+        proxyConfiguration,
+        debugLog = false,
+    } = input;
 
-const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW)
-    ? Math.max(1, +RESULTS_WANTED_RAW)
-    : 50;
-const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 5;
+    // Set log level based on input
+    if (debugLog) {
+        log.setLevel(log.LEVELS.DEBUG);
+    }
 
-log.info('Actor input', {
-    keywords,
-    location,
-    city,
-    state,
-    zip,
-    results_wanted: RESULTS_WANTED,
-    max_pages: MAX_PAGES,
-    startUrlsCount: Array.isArray(startUrls) ? startUrls.length : 0,
-});
+    const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW)
+        ? Math.max(1, +RESULTS_WANTED_RAW)
+        : 50;
+    const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 5;
 
-const dataset = await Dataset.open();
-const proxyConf = proxyConfiguration
-    ? await Actor.createProxyConfiguration(proxyConfiguration)
-    : await Actor.createProxyConfiguration({ useApifyProxy: true });
-const clientOpts = proxyConf ? { proxyUrl: await proxyConf.newUrl() } : {};
+    log.info('Actor started', {
+        keywords,
+        location,
+        results_wanted: RESULTS_WANTED,
+        max_pages: MAX_PAGES,
+        startUrlsCount: Array.isArray(startUrls) ? startUrls.length : 0,
+    });
 
-const seen = new Set();
-let totalSaved = 0;
+    const dataset = await Dataset.open();
+    const proxyConf = proxyConfiguration
+        ? await Actor.createProxyConfiguration(proxyConfiguration)
+        : await Actor.createProxyConfiguration({ useApifyProxy: true });
+    
+    if (!proxyConf) {
+        log.warning('Proxy configuration failed. Running without proxy.');
+    }
+    
+    const clientOpts = proxyConf ? { proxyUrl: await proxyConf.newUrl() } : {};
 
-// 1) Discover routes + CSRF token
-const searchPageHtml = (
-    await gotScraping({
-        url: searchUrl || `${BASE}/jobs`,
-        headers: DEFAULT_HEADERS,
-        ...clientOpts,
-    })
-).body;
-const csrfToken = extractCsrf(searchPageHtml);
-const routes = buildRouteResolver(searchPageHtml);
+    const seen = new Set();
+    let totalSaved = 0;
 
-// 2) Build search params consistent with site
-const searchParams = {
-    locale: 'en',
-    sort,
-    keywords,
-    city_state_zip: location,
-    city,
-    state,
-    zip,
-};
-if (remote === 'remote') searchParams.location_remote_option_filter = 'remote';
-if (remote === 'hybrid') searchParams.location_remote_option_filter = 'hybrid';
+    // 1) Discover routes + CSRF token
+    let searchPageHtml;
+    try {
+        const response = await gotScraping({
+            url: searchUrl || `${BASE}/jobs`,
+            headers: DEFAULT_HEADERS,
+            throwHttpErrors: false,
+            ...clientOpts,
+        });
+        
+        if (response.statusCode >= 400) {
+            throw new Error(`Failed to fetch search page: HTTP ${response.statusCode}`);
+        }
+        
+        searchPageHtml = response.body;
+    } catch (err) {
+        log.error(`Failed to fetch initial search page: ${err.message}`);
+        throw new Error(`Unable to start scraping: ${err.message}`);
+    }
+    
+    const csrfToken = extractCsrf(searchPageHtml);
+    const routes = buildRouteResolver(searchPageHtml);
 
-// 3) Collect from API
-totalSaved += await collectFromApi({
-    routes,
-    csrfToken,
-    searchParams,
-    maxPages: MAX_PAGES,
-    resultsWanted: RESULTS_WANTED,
-    seen,
-    dataset,
-    clientOpts,
-});
+    // 2) Build search params consistent with site
+    const searchParams = {
+        locale: 'en',
+        sort,
+        keywords,
+        city_state_zip: location,
+        city,
+        state,
+        zip,
+    };
+    if (remote === 'remote') searchParams.location_remote_option_filter = 'remote';
+    if (remote === 'hybrid') searchParams.location_remote_option_filter = 'hybrid';
 
-// 4) Add any direct startUrls/job URLs
-if (Array.isArray(startUrls)) {
-    for (const entry of startUrls) {
-        if (totalSaved >= RESULTS_WANTED) break;
-        const url = typeof entry === 'string' ? entry : entry?.url;
-        if (!url || seen.has(url)) continue;
-        try {
-            const item = await fetchJobPage(url, clientOpts);
-            await dataset.pushData(item);
-            seen.add(url);
-            totalSaved += 1;
-            log.info(`Saved from startUrl: ${item.title || url}`);
-        } catch (err) {
-            log.warning(`Failed to parse startUrl ${url}: ${err.message}`);
+    // 3) Collect from API
+    try {
+        totalSaved += await collectFromApi({
+            routes,
+            csrfToken,
+            searchParams,
+            maxPages: MAX_PAGES,
+            resultsWanted: RESULTS_WANTED,
+            seen,
+            dataset,
+            clientOpts,
+        });
+    } catch (err) {
+        log.error(`API collection failed: ${err.message}`);
+        // Continue to fallback methods
+    }
+
+    // 4) Add any direct startUrls/job URLs
+    if (Array.isArray(startUrls)) {
+        for (const entry of startUrls) {
+            if (totalSaved >= RESULTS_WANTED) break;
+            const url = typeof entry === 'string' ? entry : entry?.url;
+            if (!url || seen.has(url)) continue;
+            try {
+                const item = await fetchJobPage(url, clientOpts);
+                if (item) {
+                    await dataset.pushData(item);
+                    seen.add(url);
+                    totalSaved += 1;
+                    log.info(`Saved from startUrl: ${item.title || url}`);
+                }
+            } catch (err) {
+                log.warning(`Failed to parse startUrl ${url}: ${err.message}`);
+            }
         }
     }
-}
 
-// 5) Fallback to sitemap/HTML if needed
-if (totalSaved < RESULTS_WANTED) {
-    totalSaved += await collectFromSitemaps({
-        resultsWanted: RESULTS_WANTED - totalSaved,
-        seen,
-        dataset,
-        clientOpts,
-    });
-}
+    // 5) Fallback to sitemap/HTML if needed
+    if (totalSaved < RESULTS_WANTED) {
+        try {
+            totalSaved += await collectFromSitemaps({
+                resultsWanted: RESULTS_WANTED - totalSaved,
+                seen,
+                dataset,
+                clientOpts,
+            });
+        } catch (err) {
+            log.error(`Sitemap collection failed: ${err.message}`);
+        }
+    }
 
-log.info(`Done. Saved ${totalSaved} jobs (results_wanted=${RESULTS_WANTED}).`);
-await Actor.exit();
+    log.info(`Scraping completed. Saved ${totalSaved} jobs (target: ${RESULTS_WANTED}).`);
+    
+    if (totalSaved === 0) {
+        log.warning('No jobs were saved. Check your search parameters or try different filters.');
+    }
+});
