@@ -1,10 +1,13 @@
 {
-  "keywords": "engineer",
+  "keywords": "security engineer",
+  "location": "",
+  "city": "",
+  "state": "VA",
+  "zip": "",
+  "sort": "date",
+  "remote": "",
   "results_wanted": 25,
   "max_pages": 4,
-  "sort": "date",
-  "remote": "remote",
-  "debugLog": false,
   "proxyConfiguration": {
     "useApifyProxy": true,
     "apifyProxyGroups": ["RESIDENTIAL"]

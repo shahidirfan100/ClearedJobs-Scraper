@@ -7,9 +7,15 @@ const BASE = 'https://clearedjobs.net';
 const DEFAULT_HEADERS = {
     'user-agent':
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    accept: 'application/json, text/plain, */*',
-    referer: `${BASE}/jobs`,
-    'x-requested-with': 'XMLHttpRequest',
+    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'accept-language': 'en-US,en;q=0.5',
+    'accept-encoding': 'gzip, deflate, br',
+    'cache-control': 'max-age=0',
+    'upgrade-insecure-requests': '1',
+    'sec-fetch-dest': 'document',
+    'sec-fetch-mode': 'navigate',
+    'sec-fetch-site': 'none',
+    'sec-fetch-user': '?1',
 };
 
 function normalizeSpace(text = '') {
@@ -347,12 +353,10 @@ async function collectFromApi({
               ? json.jobs
               : [];
         if (!data.length) {
-            log.warning(`API returned no jobs on page ${page}`);
-            log.debug(`Response keys: ${Object.keys(json || {}).join(',')}`);
+            log.warning(`Page ${page}: no jobs found`);
             break;
         }
 
-        log.info(`Processing page ${page}: ${data.length} jobs`);
         const batch = [...data];
         const CONCURRENCY = 6;
         while (batch.length && saved < resultsWanted) {
@@ -400,7 +404,6 @@ async function collectFromApi({
                 seen.add(key);
                 await dataset.pushData(item);
                 saved += 1;
-                log.debug(`Saved job: ${item.title || item.id || 'unknown'}`);
             }
         }
 
@@ -454,7 +457,7 @@ async function collectFromSitemaps({ resultsWanted, seen, dataset, clientOpts })
             log.warning(`Failed to fetch sitemap ${sm}: ${err.message}`);
         }
     }
-    log.info(`Sitemap seed URLs: ${urls.length}`);
+    log.info(`Found ${urls.length} URLs from sitemap`);
 
     for (const url of urls) {
         if (saved >= resultsWanted) break;
@@ -465,7 +468,6 @@ async function collectFromSitemaps({ resultsWanted, seen, dataset, clientOpts })
             await dataset.pushData(item);
             seen.add(url);
             saved += 1;
-            log.debug(`Saved from sitemap: ${item.title || url}`);
         } catch (err) {
             log.warning(`Failed to parse job ${url}: ${err.message}`);
         }
@@ -475,46 +477,28 @@ async function collectFromSitemaps({ resultsWanted, seen, dataset, clientOpts })
 }
 
 await Actor.main(async () => {
-    const input = await Actor.getInput();
+    const input = await Actor.getInput() || {};
     
-    // Validate input early
-    if (!input) {
-        throw new Error('INPUT cannot be empty!');
-    }
-
     const {
+        startUrl = '',
         keywords = '',
         location = '',
         city = '',
         state = '',
         zip = '',
-        searchUrl = '',
-        startUrls = [],
-        results_wanted: RESULTS_WANTED_RAW = 50,
-        max_pages: MAX_PAGES_RAW = 5,
         sort = 'date',
         remote = '',
+        results_wanted: RESULTS_WANTED_RAW = 50,
+        max_pages: MAX_PAGES_RAW = 5,
         proxyConfiguration,
-        debugLog = false,
     } = input;
-
-    // Set log level based on input
-    if (debugLog) {
-        log.setLevel(log.LEVELS.DEBUG);
-    }
 
     const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW)
         ? Math.max(1, +RESULTS_WANTED_RAW)
         : 50;
     const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 5;
 
-    log.info('Actor started', {
-        keywords,
-        location,
-        results_wanted: RESULTS_WANTED,
-        max_pages: MAX_PAGES,
-        startUrlsCount: Array.isArray(startUrls) ? startUrls.length : 0,
-    });
+    log.info(`Scraper started - target: ${RESULTS_WANTED} jobs, max ${MAX_PAGES} pages`);
 
     const dataset = await Dataset.open();
     const proxyConf = proxyConfiguration
@@ -532,28 +516,46 @@ await Actor.main(async () => {
 
     // 1) Discover routes + CSRF token
     let searchPageHtml;
-    try {
-        const response = await gotScraping({
-            url: searchUrl || `${BASE}/jobs`,
-            headers: DEFAULT_HEADERS,
-            throwHttpErrors: false,
-            ...clientOpts,
-        });
-        
-        if (response.statusCode >= 400) {
-            throw new Error(`Failed to fetch search page: HTTP ${response.statusCode}`);
+    let attempt = 0;
+    while (attempt < 3 && !searchPageHtml) {
+        attempt += 1;
+        try {
+            const response = await gotScraping({
+                url: startUrl || `${BASE}/jobs`,
+                headers: DEFAULT_HEADERS,
+                throwHttpErrors: false,
+                ...clientOpts,
+            });
+            
+            if (response.statusCode === 403) {
+                log.warning(`HTTP 403 - retrying search page (attempt ${attempt}/3)...`);
+                await Actor.sleep(2000 * attempt);
+                continue;
+            }
+            
+            if (response.statusCode >= 400) {
+                throw new Error(`HTTP ${response.statusCode}`);
+            }
+            
+            searchPageHtml = response.body;
+        } catch (err) {
+            if (attempt < 3) {
+                log.warning(`Failed to fetch search page (attempt ${attempt}/3): ${err.message}`);
+                await Actor.sleep(2000 * attempt);
+            } else {
+                throw new Error(`Unable to fetch search page after ${attempt} attempts: ${err.message}`);
+            }
         }
-        
-        searchPageHtml = response.body;
-    } catch (err) {
-        log.error(`Failed to fetch initial search page: ${err.message}`);
-        throw new Error(`Unable to start scraping: ${err.message}`);
+    }
+    
+    if (!searchPageHtml) {
+        throw new Error('Failed to fetch initial search page');
     }
     
     const csrfToken = extractCsrf(searchPageHtml);
     const routes = buildRouteResolver(searchPageHtml);
 
-    // 2) Build search params consistent with site
+    // 2) Build search params
     const searchParams = {
         locale: 'en',
         sort,
@@ -583,27 +585,7 @@ await Actor.main(async () => {
         // Continue to fallback methods
     }
 
-    // 4) Add any direct startUrls/job URLs
-    if (Array.isArray(startUrls)) {
-        for (const entry of startUrls) {
-            if (totalSaved >= RESULTS_WANTED) break;
-            const url = typeof entry === 'string' ? entry : entry?.url;
-            if (!url || seen.has(url)) continue;
-            try {
-                const item = await fetchJobPage(url, clientOpts);
-                if (item) {
-                    await dataset.pushData(item);
-                    seen.add(url);
-                    totalSaved += 1;
-                    log.info(`Saved from startUrl: ${item.title || url}`);
-                }
-            } catch (err) {
-                log.warning(`Failed to parse startUrl ${url}: ${err.message}`);
-            }
-        }
-    }
-
-    // 5) Fallback to sitemap/HTML if needed
+    // 3) Fallback to sitemap/HTML if needed
     if (totalSaved < RESULTS_WANTED) {
         try {
             totalSaved += await collectFromSitemaps({
@@ -617,9 +599,5 @@ await Actor.main(async () => {
         }
     }
 
-    log.info(`Scraping completed. Saved ${totalSaved} jobs (target: ${RESULTS_WANTED}).`);
-    
-    if (totalSaved === 0) {
-        log.warning('No jobs were saved. Check your search parameters or try different filters.');
-    }
+    log.info(`Done - scraped ${totalSaved} jobs`);
 });

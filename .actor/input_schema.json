@@ -1,37 +1,29 @@
 {
   "title": "ClearedJobs.Net Scraper",
-  "description": "Extract security-cleared job listings from ClearedJobs.net. Filter by keywords, location, clearance level, and more. Supports API-first extraction with HTML fallback.",
+  "description": "Extract security-cleared job listings from ClearedJobs.net. Search by keywords, location, and other filters.",
   "type": "object",
   "schemaVersion": 1,
   "properties": {
-    "searchUrl": {
+    "startUrl": {
       "title": "Search URL",
       "type": "string",
-      "description": "Start scraping from a specific ClearedJobs.net search URL. If provided, this will be used instead of search filters below.",
+      "description": "Custom search URL. If empty, will use filters below.",
       "editor": "textfield",
       "default": "",
       "prefill": ""
     },
-    "startUrls": {
-      "title": "Start URLs",
-      "type": "array",
-      "description": "List of specific job URLs to scrape. Use this to scrape specific job listings.",
-      "editor": "requestListSources",
-      "default": [],
-      "prefill": []
-    },
     "keywords": {
       "title": "Keywords",
       "type": "string",
-      "description": "Job search keywords, e.g., 'Engineer', 'Analyst', 'Security', 'Intelligence'.",
+      "description": "Job search keywords (e.g., 'Engineer', 'Analyst', 'Security').",
       "editor": "textfield",
       "default": "",
       "prefill": "engineer"
     },
     "location": {
-      "title": "Location",
+      "title": "Location (City, State, ZIP)",
       "type": "string",
-      "description": "Filter jobs by location (city, state, or region). Leave empty for all locations.",
+      "description": "Search location or leave empty for all.",
       "editor": "textfield",
       "default": "",
       "prefill": ""
@@ -47,7 +39,7 @@
     "state": {
       "title": "State",
       "type": "string",
-      "description": "Specific state filter.",
+      "description": "Specific state filter (e.g., 'VA', 'MD', 'DC').",
       "editor": "textfield",
       "default": "",
       "prefill": ""
@@ -57,16 +49,6 @@
       "type": "string",
       "description": "Specific ZIP code filter.",
       "editor": "textfield",
-      "default": "",
-      "prefill": ""
-    },
-    "remote": {
-      "title": "Remote Work Option",
-      "type": "string",
-      "description": "Filter by remote work options.",
-      "editor": "select",
-      "enum": ["", "remote", "hybrid"],
-      "enumTitles": ["All", "Remote Only", "Hybrid"],
       "default": "",
       "prefill": ""
     },
@@ -80,10 +62,20 @@
       "default": "date",
       "prefill": "date"
     },
+    "remote": {
+      "title": "Remote Work",
+      "type": "string",
+      "description": "Filter by remote work option.",
+      "editor": "select",
+      "enum": ["", "remote", "hybrid"],
+      "enumTitles": ["All", "Remote Only", "Hybrid"],
+      "default": "",
+      "prefill": ""
+    },
     "results_wanted": {
-      "title": "Maximum Number of Jobs",
+      "title": "Maximum Results",
       "type": "integer",
-      "description": "The maximum number of jobs to collect. Set to a reasonable number to avoid long runs.",
+      "description": "Maximum number of jobs to collect.",
       "minimum": 1,
       "maximum": 1000,
       "default": 50,
@@ -91,27 +83,19 @@
       "editor": "number"
     },
     "max_pages": {
-      "title": "Maximum Number of Pages",
+      "title": "Maximum Pages",
       "type": "integer",
-      "description": "Safety limit on the number of search result pages to visit.",
+      "description": "Maximum number of pages to visit.",
       "minimum": 1,
       "maximum": 100,
       "default": 5,
       "prefill": 5,
       "editor": "number"
     },
-    "debugLog": {
-      "title": "Debug Log",
-      "type": "boolean",
-      "description": "Enable detailed debug logging for troubleshooting.",
-      "editor": "checkbox",
-      "default": false,
-      "prefill": false
-    },
     "proxyConfiguration": {
       "title": "Proxy Configuration",
       "type": "object",
-      "description": "Use Apify Proxy to avoid rate limiting and blocking. Residential proxies recommended for best results.",
+      "description": "Proxy settings for scraping. Recommended: Residential proxies.",
       "editor": "proxy",
       "default": {
         "useApifyProxy": true,
