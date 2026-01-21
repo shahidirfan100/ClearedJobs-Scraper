@@ -36,11 +36,6 @@ function getStealthHeaders() {
     };
 }
 
-// Balanced delay helper
-function randomDelay(min = 100, max = 400) {
-    return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-
 // Sleep utility function
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -74,7 +69,7 @@ function mapApiJob(job, detail = {}) {
     let url = job.url || detail.url || (id ? `${BASE}/job/${id}` : null);
     if (url) url = new URL(url, BASE).href;
 
-    // Extract description from API (no HTML parsing needed!)
+    // Extract description from API
     const descriptionHtml = detail.description || job.description || null;
 
     // Extract from JSON-LD if available
@@ -153,45 +148,30 @@ async function collectFromApi({
         const headers = getStealthHeaders();
 
         let json;
-        let attempt = 0;
-        while (attempt < 3 && !json) {
-            attempt += 1;
-            try {
-                const res = await gotScraping({
-                    url: endpoint,
-                    headers,
-                    searchParams: params,
-                    throwHttpErrors: false,
-                    proxyUrl: await getProxyUrl(),
-                });
+        try {
+            const res = await gotScraping({
+                url: endpoint,
+                headers,
+                searchParams: params,
+                throwHttpErrors: false,
+                proxyUrl: await getProxyUrl(),
+            });
 
-                if (res.statusCode >= 500) {
-                    log.warning(`API HTTP ${res.statusCode} on page ${page}, retry ${attempt}`);
-                    await sleep(500 * attempt + randomDelay(100, 200));
-                    continue;
-                }
-
-                json = safeJsonParse(res.body);
-
-                if (!json || typeof json !== 'object') {
-                    log.warning(`API non-JSON response on page ${page}`);
-                    break;
-                }
-            } catch (err) {
-                const errorMsg = err.message || String(err);
-                if (errorMsg.includes('ECONNRESET') || errorMsg.includes('proxy') || errorMsg.includes('595')) {
-                    log.debug(`Network/proxy error on page ${page} (attempt ${attempt}), retrying...`);
-                } else {
-                    log.warning(`API request failed page=${page} (attempt ${attempt}): ${errorMsg}`);
-                }
-
-                if (attempt < 3) {
-                    await sleep(300 * attempt + randomDelay(100, 200));
-                }
+            if (res.statusCode >= 400) {
+                log.warning(`API HTTP ${res.statusCode} on page ${page}`);
+                break;
             }
-        }
 
-        if (!json || typeof json !== 'object') break;
+            json = safeJsonParse(res.body);
+
+            if (!json || typeof json !== 'object') {
+                log.warning(`API non-JSON response on page ${page}`);
+                break;
+            }
+        } catch (err) {
+            log.warning(`API request failed page=${page}: ${err.message}`);
+            break;
+        }
 
         const data = Array.isArray(json?.data) ? json.data : [];
         if (!data.length) {
@@ -201,16 +181,17 @@ async function collectFromApi({
 
         log.info(`Page ${page}: found ${data.length} jobs`);
 
-        // Process jobs with high concurrency - API-only is much faster!
-        const CONCURRENCY = 15;
+        // Maximum concurrency for speed - API can handle it!
+        const CONCURRENCY = 25;
         const batch = [...data];
 
         while (batch.length && saved < resultsWanted) {
             const chunk = batch.splice(0, CONCURRENCY);
+
+            // Fetch all details in parallel - NO delays between requests
             const results = await Promise.all(
                 chunk.map(async (job) => {
                     try {
-                        // Fetch job detail from API to get full description
                         const detailRes = await gotScraping({
                             url: `${BASE}/api/v1/jobs/${job.id}`,
                             headers: getStealthHeaders(),
@@ -224,7 +205,6 @@ async function collectFromApi({
                             return mapApiJob(job, detail);
                         }
 
-                        // Fallback to basic data if detail fetch fails
                         return mapApiJob(job, {});
                     } catch (err) {
                         log.debug(`Failed to fetch detail for job ${job.id}: ${err.message}`);
@@ -233,6 +213,7 @@ async function collectFromApi({
                 })
             );
 
+            // Save all results from this batch
             for (const item of results) {
                 if (saved >= resultsWanted) break;
                 const key = item.url || item.id || JSON.stringify(item);
@@ -241,18 +222,14 @@ async function collectFromApi({
                 await dataset.pushData(item);
                 saved += 1;
             }
-
-            // Small delay between batches
-            await sleep(randomDelay(50, 100));
         }
+
+        log.info(`Progress: ${saved}/${resultsWanted} jobs collected`);
 
         const nextLink = json?.links?.next || null;
         if (!nextLink || page >= maxPages) break;
 
         page += 1;
-
-        // Small delay between pages
-        await sleep(randomDelay(100, 300));
     }
 
     return saved;
@@ -298,12 +275,18 @@ await Actor.main(async () => {
         locale: 'en',
         sort,
         keywords,
-        city_state_zip: location,
     };
+
+    // Add location if provided
+    if (location) {
+        searchParams.city_state_zip = location;
+    }
+
+    // Add remote filter if provided
     if (remote === 'remote') searchParams.location_remote_option_filter = 'remote';
     if (remote === 'hybrid') searchParams.location_remote_option_filter = 'hybrid';
 
-    // Collect from API (no HTML parsing needed!)
+    // Collect from API
     const totalSaved = await collectFromApi({
         searchParams,
         maxPages: MAX_PAGES,
