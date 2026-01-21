@@ -2,24 +2,42 @@ import { Actor, log } from 'apify';
 import { Dataset } from 'crawlee';
 import { gotScraping } from 'got-scraping';
 import * as cheerio from 'cheerio';
+import { HeaderGenerator } from 'header-generator';
 
 const BASE = 'https://clearedjobs.net';
-const DEFAULT_HEADERS = {
-    'user-agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'accept-language': 'en-US,en;q=0.5',
-    'accept-encoding': 'gzip, deflate, br',
-    'cache-control': 'max-age=0',
-    'upgrade-insecure-requests': '1',
-    'sec-fetch-dest': 'document',
-    'sec-fetch-mode': 'navigate',
-    'sec-fetch-site': 'none',
-    'sec-fetch-user': '?1',
-};
 
-// Stealth delay helper
-function randomDelay(min = 100, max = 500) {
+// Production-ready header generator for stealth
+const headerGenerator = new HeaderGenerator({
+    browsers: [
+        { name: 'chrome', minVersion: 120, maxVersion: 130 },
+        { name: 'firefox', minVersion: 115, maxVersion: 125 }
+    ],
+    devices: ['desktop'],
+    operatingSystems: ['windows', 'macos'],
+    locales: ['en-US'],
+});
+
+// Generate fresh stealth headers
+function getStealthHeaders() {
+    const headers = headerGenerator.getHeaders();
+    return {
+        ...headers,
+        'sec-ch-ua': '"Chromium";v="122", "Google Chrome";v="122"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        'sec-fetch-dest': 'document',
+        'sec-fetch-mode': 'navigate',
+        'sec-fetch-site': 'none',
+        'sec-fetch-user': '?1',
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'accept-language': 'en-US,en;q=0.9',
+        'cache-control': 'max-age=0',
+        'upgrade-insecure-requests': '1',
+    };
+}
+
+// Human-like delay helper
+function randomDelay(min = 500, max = 1500) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
@@ -108,7 +126,7 @@ function extractJobType(job, detail, additional) {
     );
 }
 
-function mapApiJob(job, detail = {}, additional = {}, source = 'api') {
+function mapApiJob(job, detail = {}, additional = {}) {
     const rawUrl =
         job.url || detail.url || additional.url || (job.id ? `${BASE}/job/${job.id}` : null);
     const id = job.id ?? detail.id ?? additional.id ?? null;
@@ -142,17 +160,16 @@ function mapApiJob(job, detail = {}, additional = {}, source = 'api') {
         null;
 
     return {
-        source,
         id,
         url: url || null,
         title: normalizeSpace(job.title || job.job_title || ''),
         company: normalizeSpace(job.company?.name || job.company || ''),
         location: normalizeSpace(
             job.location ||
-                detail.location ||
-                additional.location ||
-                extractFromBlocks(job, 'Location') ||
-                ''
+            detail.location ||
+            additional.location ||
+            extractFromBlocks(job, 'Location') ||
+            ''
         ),
         security_clearance: clearance || null,
         salary: salary || null,
@@ -162,24 +179,22 @@ function mapApiJob(job, detail = {}, additional = {}, source = 'api') {
         description_text: descriptionHtml
             ? normalizeSpace(cheerio.load(descriptionHtml).text())
             : job.shortDescription
-              ? normalizeSpace(job.shortDescription)
-              : null,
+                ? normalizeSpace(job.shortDescription)
+                : null,
     };
 }
 
 function mapJsonLdJob(ld) {
     const url = ld.url ? new URL(ld.url, BASE).href : null;
     return {
-        source: 'jsonld',
         id: ld.identifier || null,
         url,
         title: normalizeSpace(ld.title || ''),
         company: normalizeSpace(ld.hiringOrganization?.name || ''),
         location: normalizeSpace(
             ld.jobLocation?.address?.addressLocality
-                ? `${ld.jobLocation.address.addressLocality}, ${
-                      ld.jobLocation.address.addressRegion || ''
-                  }`.trim()
+                ? `${ld.jobLocation.address.addressLocality}, ${ld.jobLocation.address.addressRegion || ''
+                    }`.trim()
                 : ld.jobLocation?.address?.addressRegion || ''
         ),
         security_clearance: ld.securityClearanceRequirement || null,
@@ -196,44 +211,41 @@ function mapJsonLdJob(ld) {
     };
 }
 
-async function fetchJobPage(url, clientOpts) {
+async function fetchJobPage(url, getProxyUrl) {
     try {
         const res = await gotScraping({
             url,
-            headers: DEFAULT_HEADERS,
+            headers: getStealthHeaders(),
             throwHttpErrors: false,
-            ...clientOpts,
+            proxyUrl: await getProxyUrl(),
         });
 
         if (res.statusCode >= 400) {
-            log.warning(`Job page blocked (${res.statusCode}) for ${url}`);
             return null;
         }
 
-    const $ = cheerio.load(res.body);
-    const ldScript = $('script[type="application/ld+json"]').first().text();
-    if (ldScript) {
-        const ld = safeJsonParse(ldScript);
-        if (ld && ld['@type'] === 'JobPosting') return mapJsonLdJob(ld);
-    }
+        const $ = cheerio.load(res.body);
+        const ldScript = $('script[type="application/ld+json"]').first().text();
+        if (ldScript) {
+            const ld = safeJsonParse(ldScript);
+            if (ld && ld['@type'] === 'JobPosting') return mapJsonLdJob(ld);
+        }
 
-    const title = normalizeSpace($('h1').first().text());
-    const company = normalizeSpace($('.company,.employer').first().text());
-    const location = normalizeSpace($('.location').first().text());
-    const descHtml = $('main, .job-description').first().html() || null;
-    const descText = descHtml ? normalizeSpace(cheerio.load(descHtml).text()) : null;
+        const title = normalizeSpace($('h1').first().text());
+        const company = normalizeSpace($('.company,.employer').first().text());
+        const location = normalizeSpace($('.location').first().text());
+        const descHtml = $('main, .job-description').first().html() || null;
+        const descText = descHtml ? normalizeSpace(cheerio.load(descHtml).text()) : null;
 
-    return {
-        source: 'html',
-        url,
-        title,
-        company,
-        location,
-        description_html: descHtml,
-        description_text: descText,
-    };
-    } catch (err) {
-        log.warning(`Failed to fetch job page ${url}: ${err.message}`);
+        return {
+            url,
+            title,
+            company,
+            location,
+            description_html: descHtml,
+            description_text: descText,
+        };
+    } catch {
         return null;
     }
 }
@@ -246,70 +258,56 @@ async function collectFromApi({
     resultsWanted,
     seen,
     dataset,
-    clientOpts,
+    getProxyUrl,
 }) {
     let saved = 0;
     let page = 1;
     const indexFn = typeof routes.index === 'function' ? routes.index : () => `${BASE}/api/v1/jobs`;
     let endpoint = indexFn();
-    const headers = {
-        ...DEFAULT_HEADERS,
-        'x-csrf-token': csrfToken || '',
-    };
 
     async function fetchDetails(jobId) {
         const results = { detail: {}, additional: {} };
+        const headers = {
+            ...getStealthHeaders(),
+            'x-csrf-token': csrfToken || '',
+        };
+
         try {
             const res = await gotScraping({
                 url: routes.show({ job: jobId }),
                 headers,
                 throwHttpErrors: false,
-                ...clientOpts,
+                proxyUrl: await getProxyUrl(),
             });
             if (res.statusCode < 400) {
                 const json = safeJsonParse(res.body, {});
                 results.detail = json?.data || json || {};
-            } else if (res.statusCode >= 500) {
-                log.debug(`Job detail HTTP ${res.statusCode} for ${jobId}`);
             }
-        } catch (err) {
-            // Handle proxy/network errors gracefully
-            const errorMsg = err.message || String(err);
-            if (errorMsg.includes('ECONNRESET') || errorMsg.includes('proxy') || errorMsg.includes('595')) {
-                log.debug(`Network/proxy error fetching job detail ${jobId}`);
-            } else {
-                log.debug(`Job detail fetch failed for ${jobId}: ${errorMsg}`);
-            }
-        }
+        } catch { /* ignore */ }
 
         try {
             const res = await gotScraping({
                 url: routes.additional({ job: jobId }),
                 headers,
                 throwHttpErrors: false,
-                ...clientOpts,
+                proxyUrl: await getProxyUrl(),
             });
             if (res.statusCode < 400) {
                 const json = safeJsonParse(res.body, {});
                 results.additional = json?.data || json || {};
-            } else if (res.statusCode >= 500) {
-                log.debug(`Job additional HTTP ${res.statusCode} for ${jobId}`);
             }
-        } catch (err) {
-            // Handle proxy/network errors gracefully
-            const errorMsg = err.message || String(err);
-            if (errorMsg.includes('ECONNRESET') || errorMsg.includes('proxy') || errorMsg.includes('595')) {
-                log.debug(`Network/proxy error fetching job additional ${jobId}`);
-            } else {
-                log.debug(`Job additional fetch failed for ${jobId}: ${errorMsg}`);
-            }
-        }
+        } catch { /* ignore */ }
 
         return results;
     }
 
     while (saved < resultsWanted && page <= maxPages) {
         const params = { ...searchParams, page };
+        const headers = {
+            ...getStealthHeaders(),
+            'x-csrf-token': csrfToken || '',
+        };
+
         let json;
         let attempt = 0;
         while (attempt < 3 && !json) {
@@ -320,30 +318,19 @@ async function collectFromApi({
                     headers,
                     searchParams: params,
                     throwHttpErrors: false,
-                    ...clientOpts,
+                    proxyUrl: await getProxyUrl(),
                 });
-                const contentType = res.headers['content-type'] || '';
+
                 if (res.statusCode >= 500) {
-                    log.warning(`API HTTP ${res.statusCode} on page ${page}, retry ${attempt}`);
                     await Actor.sleep(800 * attempt + randomDelay(100, 300));
                     continue;
                 }
                 json = safeJsonParse(res.body);
 
                 if (!json || typeof json !== 'object') {
-                    log.warning(`API non-JSON response on page ${page}`);
-                    log.debug(`Content-Type: ${contentType}, Body snippet: ${res.body?.slice?.(0, 200) || ''}`);
                     break;
                 }
-            } catch (err) {
-                const errorMsg = err.message || String(err);
-                // Handle proxy/network errors gracefully
-                if (errorMsg.includes('ECONNRESET') || errorMsg.includes('proxy') || errorMsg.includes('595')) {
-                    log.warning(`Network/proxy error on page ${page} (attempt ${attempt}), retrying...`);
-                } else {
-                    log.warning(`API request failed page=${page} (attempt ${attempt}): ${errorMsg}`);
-                }
-                
+            } catch {
                 if (attempt < 3) {
                     await Actor.sleep(500 * attempt + randomDelay(100, 300));
                 }
@@ -355,46 +342,41 @@ async function collectFromApi({
         const data = Array.isArray(json?.data)
             ? json.data
             : Array.isArray(json?.jobs)
-              ? json.jobs
-              : [];
-        if (!data.length) {
-            log.warning(`Page ${page}: no jobs found`);
-            break;
-        }
+                ? json.jobs
+                : [];
+        if (!data.length) break;
 
+        // Process jobs with reduced concurrency for stealth
+        const CONCURRENCY = 5;
         const batch = [...data];
-        const CONCURRENCY = 12;
         while (batch.length && saved < resultsWanted) {
             const chunk = batch.splice(0, CONCURRENCY);
             const results = await Promise.all(
                 chunk.map(async (job) => {
                     const { detail, additional } = await fetchDetails(job.id);
-                    const item = mapApiJob(job, detail, additional, 'api');
+                    const item = mapApiJob(job, detail, additional);
+
+                    // Enrich with HTML if missing critical data
                     if (
                         item.url &&
                         !seen.has(item.url) &&
                         (
                             (!item.description_html || (item.description_text || '').length < 500) ||
                             !item.job_type ||
-                            !item.security_clearance ||
-                            !item.location ||
-                            !item.salary
+                            !item.security_clearance
                         )
                     ) {
-                        const htmlItem = await fetchJobPage(item.url, clientOpts);
+                        const htmlItem = await fetchJobPage(item.url, getProxyUrl);
                         if (htmlItem) {
                             const existingTextLen = (item.description_text || '').length;
                             const htmlTextLen = (htmlItem.description_text || '').length;
                             if (!item.description_html || htmlTextLen > existingTextLen) {
-                                item.description_html =
-                                    htmlItem.description_html || item.description_html;
-                                item.description_text =
-                                    htmlItem.description_text || item.description_text;
+                                item.description_html = htmlItem.description_html || item.description_html;
+                                item.description_text = htmlItem.description_text || item.description_text;
                             }
                             item.job_type = item.job_type || htmlItem.job_type || null;
                             item.location = item.location || htmlItem.location || null;
-                            item.security_clearance =
-                                item.security_clearance || htmlItem.security_clearance || null;
+                            item.security_clearance = item.security_clearance || htmlItem.security_clearance || null;
                             item.salary = item.salary || htmlItem.salary || null;
                         }
                     }
@@ -409,41 +391,44 @@ async function collectFromApi({
                 seen.add(key);
                 await dataset.pushData(item);
                 saved += 1;
-                // Small random delay for stealth
-                await Actor.sleep(randomDelay(50, 150));
             }
+
+            // Human-like delay between batches
+            await Actor.sleep(randomDelay(300, 800));
         }
 
         const nextLink = json?.links?.next || null;
         if (!nextLink) break;
         page += 1;
         endpoint = nextLink.startsWith('http') ? nextLink : endpoint;
-        // Small delay between pages for stealth
-        if (page <= maxPages) await Actor.sleep(randomDelay(200, 500));
+
+        // Human-like delay between pages
+        if (page <= maxPages) await Actor.sleep(randomDelay(500, 1200));
     }
 
     return saved;
 }
 
-async function collectFromSitemaps({ resultsWanted, seen, dataset, clientOpts }) {
+async function collectFromSitemaps({ resultsWanted, seen, dataset, getProxyUrl }) {
     let saved = 0;
     const indexUrl = `${BASE}/sitemap.xml`;
     let sitemapList = [];
+
     try {
-        const res = await gotScraping({ url: indexUrl, headers: DEFAULT_HEADERS, ...clientOpts });
+        const res = await gotScraping({
+            url: indexUrl,
+            headers: getStealthHeaders(),
+            proxyUrl: await getProxyUrl(),
+        });
         sitemapList = [...res.body.matchAll(/<loc>([^<]+sitemap_[^<]+\.xml)<\/loc>/g)].map(
             (m) => m[1]
         );
-    } catch (err) {
-        log.warning(`Failed to fetch sitemap index: ${err.message}`);
+    } catch {
         return saved;
     }
 
     const jobSitemaps = sitemapList.filter((u) => u.includes('sitemap_active_jobs'));
-    if (!jobSitemaps.length) {
-        log.warning('No job sitemaps discovered in sitemap index.');
-        return saved;
-    }
+    if (!jobSitemaps.length) return saved;
 
     const urls = [];
     for (const sm of jobSitemaps) {
@@ -451,35 +436,28 @@ async function collectFromSitemaps({ resultsWanted, seen, dataset, clientOpts })
         try {
             const res = await gotScraping({
                 url: sm,
-                headers: DEFAULT_HEADERS,
+                headers: getStealthHeaders(),
                 throwHttpErrors: false,
-                ...clientOpts,
+                proxyUrl: await getProxyUrl(),
             });
-            if (res.statusCode >= 400) {
-                log.warning(`Sitemap ${sm} blocked (${res.statusCode})`);
-                continue;
-            }
+            if (res.statusCode >= 400) continue;
             urls.push(
                 ...[...res.body.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]).slice(0, resultsWanted)
             );
-        } catch (err) {
-            log.warning(`Failed to fetch sitemap ${sm}: ${err.message}`);
-        }
+        } catch { /* ignore */ }
     }
-    log.info(`Found ${urls.length} URLs from sitemap`);
 
     for (const url of urls) {
         if (saved >= resultsWanted) break;
         if (seen.has(url)) continue;
         try {
-            const item = await fetchJobPage(url, clientOpts);
+            const item = await fetchJobPage(url, getProxyUrl);
             if (!item) continue;
             await dataset.pushData(item);
             seen.add(url);
             saved += 1;
-        } catch (err) {
-            log.warning(`Failed to parse job ${url}: ${err.message}`);
-        }
+            await Actor.sleep(randomDelay(300, 600));
+        } catch { /* ignore */ }
     }
 
     return saved;
@@ -487,43 +465,37 @@ async function collectFromSitemaps({ resultsWanted, seen, dataset, clientOpts })
 
 await Actor.main(async () => {
     const input = await Actor.getInput() || {};
-    
+
     const {
         startUrl = '',
         keywords = '',
         location = '',
-        city = '',
-        state = '',
-        zip = '',
         sort = 'date',
         remote = '',
-        results_wanted: RESULTS_WANTED_RAW = 50,
-        max_pages: MAX_PAGES_RAW = 5,
+        results_wanted: RESULTS_WANTED_RAW = 20,
+        max_pages: MAX_PAGES_RAW = 3,
         proxyConfiguration,
     } = input;
 
     const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW)
         ? Math.max(1, +RESULTS_WANTED_RAW)
-        : 50;
-    const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 5;
+        : 20;
+    const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 3;
 
-    log.info(`Scraper started - target: ${RESULTS_WANTED} jobs, max ${MAX_PAGES} pages`);
+    log.info(`Starting scraper: target ${RESULTS_WANTED} jobs, max ${MAX_PAGES} pages`);
 
     const dataset = await Dataset.open();
     const proxyConf = proxyConfiguration
         ? await Actor.createProxyConfiguration(proxyConfiguration)
         : await Actor.createProxyConfiguration({ useApifyProxy: true });
-    
-    if (!proxyConf) {
-        log.warning('Proxy configuration failed. Running without proxy.');
-    }
-    
-    const clientOpts = proxyConf ? { proxyUrl: await proxyConf.newUrl() } : {};
+
+    // Proxy rotation function - new proxy per request
+    const getProxyUrl = async () => proxyConf ? await proxyConf.newUrl() : undefined;
 
     const seen = new Set();
     let totalSaved = 0;
 
-    // 1) Discover routes + CSRF token
+    // Discover routes + CSRF token
     let searchPageHtml;
     let attempt = 0;
     while (attempt < 3 && !searchPageHtml) {
@@ -531,53 +503,48 @@ await Actor.main(async () => {
         try {
             const response = await gotScraping({
                 url: startUrl || `${BASE}/jobs`,
-                headers: DEFAULT_HEADERS,
+                headers: getStealthHeaders(),
                 throwHttpErrors: false,
-                ...clientOpts,
+                proxyUrl: await getProxyUrl(),
             });
-            
+
             if (response.statusCode === 403) {
-                log.warning(`HTTP 403 - retrying search page (attempt ${attempt}/3)...`);
-                await Actor.sleep(1000 * attempt + randomDelay(100, 400));
+                await Actor.sleep(1000 * attempt + randomDelay(200, 500));
                 continue;
             }
-            
+
             if (response.statusCode >= 400) {
                 throw new Error(`HTTP ${response.statusCode}`);
             }
-            
+
             searchPageHtml = response.body;
         } catch (err) {
             if (attempt < 3) {
-                log.warning(`Failed to fetch search page (attempt ${attempt}/3): ${err.message}`);
-                await Actor.sleep(1000 * attempt + randomDelay(100, 400));
+                await Actor.sleep(1000 * attempt + randomDelay(200, 500));
             } else {
-                throw new Error(`Unable to fetch search page after ${attempt} attempts: ${err.message}`);
+                throw new Error(`Failed to load search page: ${err.message}`);
             }
         }
     }
-    
+
     if (!searchPageHtml) {
         throw new Error('Failed to fetch initial search page');
     }
-    
+
     const csrfToken = extractCsrf(searchPageHtml);
     const routes = buildRouteResolver(searchPageHtml);
 
-    // 2) Build search params
+    // Build search params
     const searchParams = {
         locale: 'en',
         sort,
         keywords,
         city_state_zip: location,
-        city,
-        state,
-        zip,
     };
     if (remote === 'remote') searchParams.location_remote_option_filter = 'remote';
     if (remote === 'hybrid') searchParams.location_remote_option_filter = 'hybrid';
 
-    // 3) Collect from API
+    // Collect from API (primary method - fast)
     try {
         totalSaved += await collectFromApi({
             routes,
@@ -587,26 +554,25 @@ await Actor.main(async () => {
             resultsWanted: RESULTS_WANTED,
             seen,
             dataset,
-            clientOpts,
+            getProxyUrl,
         });
     } catch (err) {
-        log.error(`API collection failed: ${err.message}`);
-        // Continue to fallback methods
+        log.warning(`API collection issue: ${err.message}`);
     }
 
-    // 3) Fallback to sitemap/HTML if needed
+    // Fallback to sitemap/HTML if needed
     if (totalSaved < RESULTS_WANTED) {
         try {
             totalSaved += await collectFromSitemaps({
                 resultsWanted: RESULTS_WANTED - totalSaved,
                 seen,
                 dataset,
-                clientOpts,
+                getProxyUrl,
             });
         } catch (err) {
-            log.error(`Sitemap collection failed: ${err.message}`);
+            log.warning(`Sitemap fallback issue: ${err.message}`);
         }
     }
 
-    log.info(`Done - scraped ${totalSaved} jobs`);
+    log.info(`Completed: scraped ${totalSaved} jobs`);
 });

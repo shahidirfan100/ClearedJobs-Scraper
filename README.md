@@ -1,271 +1,199 @@
-# ClearedJobs.Net Scraper
+# ClearedJobs Scraper
 
-Extract security-cleared job listings from ClearedJobs.net with advanced filtering capabilities. This scraper now calls the site’s JSON API first (fast, lightweight), then falls back to HTML/JSON-LD via sitemaps if the API is empty or blocked.
+Extract security-cleared job listings from ClearedJobs.net with ease. Collect comprehensive job data including title, company, location, and clearance requirements at scale. Perfect for talent acquisition, market research, and competitive intelligence in the defense industry.
 
-## Key Features
+---
 
-- **Comprehensive Data Extraction** - Captures job titles, company names, locations, security clearance requirements, salaries, job types, posting dates, and full descriptions
-- **Advanced Filtering** - Search by keywords, location, and security clearance level
-- **API-First Architecture** - Prioritizes JSON API extraction with intelligent HTML fallback for maximum reliability
-- **Full Detail Scraping** - Optional deep extraction visits individual job pages for complete information
-- **Smart Pagination** - Automatically navigates through multiple pages of results
-- **Proxy Support** - Built-in support for Apify Proxy to ensure uninterrupted data collection
+## Features
 
-## Input Configuration (key fields)
+- **Comprehensive Data Extraction** — Capture titles, companies, locations, clearances, salaries, and full descriptions
+- **Smart Filtering** — Search by specific keywords, locations, and remote work options
+- **Automated Pagination** — Effortlessly navigate through multiple pages of job results
+- **Stealth Mode** — Built-in browser fingerprinting and proxy rotation for reliable collection
+- **Deep Extraction** — Automatically collects detailed job information from individual listings
 
-- `keywords` (string): Query terms (e.g., “engineer”, “cyber”).
-- `location` / `city` / `state` / `zip` (string): Location filters passed to the API.
-- `remote` (string): `remote` or `hybrid` to match the site’s remote filters.
-- `sort` (string): `date` (recommended) or `relevance`.
-- `results_wanted` (int): Max jobs to save.
-- `max_pages` (int): API pagination safety cap.
-- `startUrls` (array): Direct job URLs to force-collect (skips API).
-- `searchUrl` (string, optional): Custom `/jobs?...` page to seed route discovery.
-- `proxyConfiguration` (object): Standard Apify proxy settings.
+---
+
+## Use Cases
+
+### Talent Acquisition
+Identify and track job openings from major defense contractors. Build a database of hiring trends and skill requirements to optimize your technical recruiting strategies.
+
+### Competitive Intelligence
+Monitor competitor hiring activity in the cleared sector. Understand which companies are expanding their teams, what technologies they prioritize, and which clearance levels are in high demand.
+
+### Market Analysis
+Analyze salary trends and geographic hotspots for security-cleared positions. Identify emerging markets and shift in industry requirements across various clearance levels.
+
+### Personal Job Monitoring
+Automate your job search by monitoring specific keywords and locations. Stay ahead of the competition with the latest listings delivered through scheduled runs.
+
+---
+
+## Input Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `keywords` | String | No | `""` | Job search keywords (e.g., 'Engineer', 'Analyst') |
+| `location` | String | No | `""` | Search location (City, State, or ZIP) |
+| `sort` | String | No | `"date"` | Sort order: `date` (Recent) or `relevance` |
+| `remote` | String | No | `""` | Filter: `remote` (Only), `hybrid`, or empty (All) |
+| `results_wanted` | Integer | No | `20` | Maximum number of job listings to collect |
+| `max_pages` | Integer | No | `3` | Maximum number of search pages to process |
+| `startUrl` | String | No | `""` | Custom search URL to override default filters |
+| `proxyConfiguration` | Object | No | `{"useApifyProxy": true}` | Proxy settings (Residential recommended) |
+
+---
 
 ## Output Data
 
-Each job listing includes the following fields:
+Each item in the dataset contains detailed job information:
 
-```json
-{
-  "title": "Senior Software Engineer",
-  "company": "Lockheed Martin",
-  "location": "Fort Worth, Texas",
-  "security_clearance": "Secret",
-  "salary": "$120,000 - $150,000",
-  "job_type": "Full time",
-  "date_posted": "December 1, 2025",
-  "description_html": "<p>Full HTML description...</p>",
-  "description_text": "Plain text description...",
-  "url": "https://clearedjobs.net/job/..."
-}
-```
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | String | Internal job identifier |
+| `url` | String | Direct link to the job listing |
+| `title` | String | Job title |
+| `company` | String | Employer or company name |
+| `location` | String | Job location (City, State) |
+| `security_clearance` | String | Required security clearance level |
+| `salary` | String | Salary information if provided |
+| `job_type` | String | Employment type (e.g., Full time, Contract) |
+| `date_posted` | String | When the listing was published |
+| `description_html` | String | Full job description in HTML format |
+| `description_text` | String | Clean text version of the job description |
 
-### Output Fields
-
-<table>
-<thead>
-<tr>
-<th>Field</th>
-<th>Type</th>
-<th>Description</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><strong>title</strong></td>
-<td>String</td>
-<td>Job title</td>
-</tr>
-<tr>
-<td><strong>company</strong></td>
-<td>String</td>
-<td>Employer name</td>
-</tr>
-<tr>
-<td><strong>location</strong></td>
-<td>String</td>
-<td>Job location (city, state)</td>
-</tr>
-<tr>
-<td><strong>security_clearance</strong></td>
-<td>String</td>
-<td>Required security clearance level</td>
-</tr>
-<tr>
-<td><strong>salary</strong></td>
-<td>String</td>
-<td>Salary information (if available)</td>
-</tr>
-<tr>
-<td><strong>job_type</strong></td>
-<td>String</td>
-<td>Employment type (Full time, Part time, Contract, etc.)</td>
-</tr>
-<tr>
-<td><strong>date_posted</strong></td>
-<td>String</td>
-<td>Date the job was posted</td>
-</tr>
-<tr>
-<td><strong>description_html</strong></td>
-<td>String</td>
-<td>Full job description in HTML format</td>
-</tr>
-<tr>
-<td><strong>description_text</strong></td>
-<td>String</td>
-<td>Job description in plain text</td>
-</tr>
-<tr>
-<td><strong>url</strong></td>
-<td>String</td>
-<td>Direct link to job posting</td>
-</tr>
-</tbody>
-</table>
+---
 
 ## Usage Examples
 
-### Quick examples
+### Basic Job Search
+
+Collect the latest engineering jobs in Virginia:
 
 ```json
 {
-  "keywords": "engineer",
-  "sort": "date",
-  "results_wanted": 25,
-  "max_pages": 4,
-  "remote": "remote",
-  "proxyConfiguration": {
-    "useApifyProxy": true,
-    "apifyProxyGroups": ["RESIDENTIAL"]
-  }
+    "keywords": "engineer",
+    "location": "Virginia",
+    "results_wanted": 50
 }
 ```
+
+### Remote & Hybrid Monitoring
+
+Filter for remote-only software developer positions across the US:
 
 ```json
 {
-  "startUrls": [
-    "https://clearedjobs.net/job/senior-software-engineer-aurora-colorado-1059802"
-  ],
-  "results_wanted": 5
+    "keywords": "software developer",
+    "remote": "remote",
+    "results_wanted": 100,
+    "sort": "date"
 }
 ```
 
-## Performance & Best Practices
+### High-Volume Extraction
 
-### Optimization Tips
+Large-scale collection using residential proxies for maximum reliability:
 
-- **Use Specific Keywords** - Narrow searches return faster and more relevant results
-- **Enable Proxy** - Use Apify Proxy (residential) to avoid rate limiting
-- **Adjust collectDetails** - Set to `false` for faster collection when full descriptions aren't needed
-- **Set Reasonable Limits** - Use `results_wanted` and `max_pages` to control run time and compute units
+```json
+{
+    "keywords": "security clearance",
+    "location": "Arlington, VA",
+    "results_wanted": 250,
+    "max_pages": 10,
+    "proxyConfiguration": {
+        "useApifyProxy": true,
+        "apifyProxyGroups": ["RESIDENTIAL"]
+    }
+}
+```
 
-### Expected Performance
+---
 
-<table>
-<thead>
-<tr>
-<th>Results</th>
-<th>Detail Mode</th>
-<th>Estimated Time</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>20 jobs</td>
-<td>Off</td>
-<td>30-60 seconds</td>
-</tr>
-<tr>
-<td>20 jobs</td>
-<td>On</td>
-<td>1-2 minutes</td>
-</tr>
-<tr>
-<td>50 jobs</td>
-<td>Off</td>
-<td>1-2 minutes</td>
-</tr>
-<tr>
-<td>50 jobs</td>
-<td>On</td>
-<td>2-3 minutes</td>
-</tr>
-</tbody>
-</table>
+## Sample Output
 
-*Times may vary based on network conditions and proxy performance*
+```json
+{
+  "id": "1059802",
+  "url": "https://clearedjobs.net/job/senior-software-engineer-aurora-colorado-1059802",
+  "title": "Senior Software Engineer",
+  "company": "Top Tier Defense",
+  "location": "Aurora, Colorado",
+  "security_clearance": "Top Secret / SCI",
+  "salary": "$145,000 - $185,000",
+  "job_type": "Full time",
+  "date_posted": "2025-12-01T08:00:00Z",
+  "description_html": "<h3>Job Summary</h3><p>We are seeking a highly skilled...</p>",
+  "description_text": "Job Summary: We are seeking a highly skilled..."
+}
+```
 
-## Common Use Cases
+---
 
-### Defense Contractors & Recruiters
-Find qualified candidates by extracting jobs matching specific clearance levels and technical skills. Export data for talent pipeline management.
+## Tips for Best Results
 
-### Job Seekers
-Monitor new postings in your area and skill set. Set up scheduled runs to receive fresh opportunities automatically.
+### Optimize Your Search
+- Use specific keywords like "TS/SCI" or "Polygraph" to narrow results
+- Combine location and keywords for the most relevant matches
+- Start with `results_wanted: 20` to verify your search criteria
 
-### Market Research
-Analyze hiring trends in the cleared job market, including salary ranges, in-demand skills, and geographic hotspots.
+### Reliability & Stealth
+- **Residential Proxies** — Always use residential proxies for large-scale collection to avoid rate limiting
+- **Page Limits** — Set a reasonable `max_pages` for your total result count to optimize performance
+- **Sort Order** — Use `date` to ensure you are getting the most recent opportunities
 
-### Competitive Intelligence
-Track which companies are hiring, what positions are in demand, and required clearance levels across the industry.
+---
 
-## Troubleshooting
+## Integrations
 
-### Common Issues
+Connect your cleared job data with your favorite tools:
 
-<details>
-<summary><strong>No results returned</strong></summary>
+- **Google Sheets** — Export directly to spreadsheets for analysis
+- **Airtable** — Build a searchable talent pipeline
+- **Slack** — Get notified of new executive openings
+- **Make / Zapier** — Create fully automated hiring workflows
 
-- Check your filter parameters are not too restrictive
-- Verify the clearance level spelling matches available options
-- Try broader keywords or remove location filters
-- Ensure proxy is configured if IP is blocked
-</details>
+### Export Formats
 
-<details>
-<summary><strong>Partial data in results</strong></summary>
+- **JSON** — Ready for API integrations and custom apps
+- **CSV** — Best for Excel and spreadsheet analysis
+- **Excel** — Formatted business reports
+- **XML** — For enterprise system ingestion
 
-- Enable `collectDetails: true` for complete information
-- Some job listings may not include all fields (salary, clearance details)
-- Check that the scraper completed successfully without errors
-</details>
+---
 
-<details>
-<summary><strong>Scraper runs slowly</strong></summary>
+## Frequently Asked Questions
 
-- Reduce `results_wanted` and `max_pages`
-- Use more specific search filters to narrow results
-- Ensure proxy configuration is optimal (residential recommended)
-- Set `collectDetails: false` if full descriptions aren't required
-</details>
+### Do I need an account on ClearedJobs.net?
+No, this scraper extracts publicly available job listings without requiring any login or account.
 
-<details>
-<summary><strong>Rate limiting or blocks</strong></summary>
+### How fresh is the data?
+The scraper can collect the very latest postings in real-time. Use the `sort: "date"` parameter to prioritize new listings.
 
-- Enable Apify Proxy with residential IPs
-- Reduce scraping speed by decreasing concurrency in proxy settings
-- Add delays between requests if running outside Apify platform
-</details>
+### Can I collect full job descriptions?
+Yes, the scraper automatically visits each job page to extract the full HTML and text descriptions.
 
-## Data Export Options
+### What proxies are recommended?
+We highly recommend using Apify Residential proxies to ensure maximum reliability and avoid IP blocks during large runs.
 
-Export your scraped data in multiple formats:
+### Is there a limit to how many jobs I can scrape?
+The practical limit is set by the website's total results. You can use `results_wanted` to control your collection size.
 
-- **JSON** - Structured data for programmatic processing
-- **CSV** - Spreadsheet-compatible for analysis in Excel/Google Sheets
-- **Excel** - Formatted spreadsheet with headers
-- **HTML** - Human-readable table format
-- **XML** - For integration with enterprise systems
+---
 
-Access exported data via:
-- Direct download from Apify Console
-- Apify API endpoints
-- Webhook notifications
-- Scheduled delivery to cloud storage
+## Support
 
-## Legal & Ethical Considerations
+For issues or feature requests, contact support through the Apify Console.
 
-This scraper is designed for legal data extraction from publicly available job listings. Users are responsible for:
+### Resources
 
-- Complying with ClearedJobs.net Terms of Service
-- Respecting robots.txt and rate limits
-- Using collected data ethically and legally
-- Adhering to data privacy regulations (GDPR, CCPA, etc.)
-- Not using data for spam or unauthorized purposes
+- [Apify Documentation](https://docs.apify.com/)
+- [API Reference](https://docs.apify.com/api/v2)
+- [Scheduling Runs](https://docs.apify.com/schedules)
 
-## Support & Feedback
+---
 
-For issues, questions, or feature requests:
+## Legal Notice
 
-- Check the Apify Console logs for detailed error messages
-- Review this documentation for configuration guidance
-- Contact support through the Apify platform
-- Rate and review to help improve this scraper
-
-<p align="center">
-<strong>Built for the Apify platform</strong><br>
-Reliable • Scalable • Easy to Use
-</p>
+This actor is designed for legitimate data collection purposes. Users are responsible for ensuring compliance with website terms of service and applicable laws. Use data responsibly and respect website rate limits.

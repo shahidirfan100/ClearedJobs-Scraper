@@ -28,37 +28,19 @@
       "default": "",
       "prefill": ""
     },
-    "city": {
-      "title": "City",
-      "type": "string",
-      "description": "Specific city filter.",
-      "editor": "textfield",
-      "default": "",
-      "prefill": ""
-    },
-    "state": {
-      "title": "State",
-      "type": "string",
-      "description": "Specific state filter (e.g., 'VA', 'MD', 'DC').",
-      "editor": "textfield",
-      "default": "",
-      "prefill": ""
-    },
-    "zip": {
-      "title": "ZIP Code",
-      "type": "string",
-      "description": "Specific ZIP code filter.",
-      "editor": "textfield",
-      "default": "",
-      "prefill": ""
-    },
     "sort": {
       "title": "Sort Order",
       "type": "string",
       "description": "How to sort job listings.",
       "editor": "select",
-      "enum": ["date", "relevance"],
-      "enumTitles": ["Most Recent", "Most Relevant"],
+      "enum": [
+        "date",
+        "relevance"
+      ],
+      "enumTitles": [
+        "Most Recent",
+        "Most Relevant"
+      ],
       "default": "date",
       "prefill": "date"
     },
@@ -67,8 +49,16 @@
       "type": "string",
       "description": "Filter by remote work option.",
       "editor": "select",
-      "enum": ["", "remote", "hybrid"],
-      "enumTitles": ["All", "Remote Only", "Hybrid"],
+      "enum": [
+        "",
+        "remote",
+        "hybrid"
+      ],
+      "enumTitles": [
+        "All",
+        "Remote Only",
+        "Hybrid"
+      ],
       "default": "",
       "prefill": ""
     },
@@ -99,11 +89,15 @@
       "editor": "proxy",
       "default": {
         "useApifyProxy": true,
-        "apifyProxyGroups": ["RESIDENTIAL"]
+        "apifyProxyGroups": [
+          "RESIDENTIAL"
+        ]
       },
       "prefill": {
         "useApifyProxy": true,
-        "apifyProxyGroups": ["RESIDENTIAL"]
+        "apifyProxyGroups": [
+          "RESIDENTIAL"
+        ]
       }
     }
   },
