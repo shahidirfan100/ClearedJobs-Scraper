@@ -36,6 +36,11 @@ function getStealthHeaders() {
     };
 }
 
+// Sleep utility
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 function normalizeSpace(text = '') {
     return text.replace(/\s+/g, ' ').trim();
 }
@@ -64,17 +69,11 @@ function mapApiJob(job, detail = {}) {
     let url = job.url || detail.url || (id ? `${BASE}/job/${id}` : null);
     if (url) url = new URL(url, BASE).href;
 
-    // FULL description from detail API
     const descriptionHtml = detail.description || job.description || null;
-
-    // Extract from JSON-LD if available
     const jsonLd = detail.jsonLd || {};
-
-    // Extract from customBlockBottom for security clearance
     const customBlocks = detail.customBlockBottom || detail.customBlockList || [];
     const clearanceFromBlocks = extractFromBlocks(customBlocks, 'Security Clearance');
 
-    // Extract location - prioritize detail API
     const location = normalizeSpace(
         detail.location ||
         job.location ||
@@ -83,20 +82,14 @@ function mapApiJob(job, detail = {}) {
         ''
     );
 
-    // Extract salary
-    const salary = detail.salary ||
-        job.salary ||
-        jsonLd.baseSalary?.value?.value ||
-        null;
+    const salary = detail.salary || job.salary || jsonLd.baseSalary?.value?.value || null;
 
-    // Extract security clearance
     const security_clearance = clearanceFromBlocks ||
         detail.security_clearance ||
         job.security_clearance ||
         jsonLd.industry ||
         null;
 
-    // Extract job type
     const job_type = detail.position_type ||
         detail.job_type ||
         detail.employment_type ||
@@ -126,6 +119,41 @@ function mapApiJob(job, detail = {}) {
     };
 }
 
+// Retry wrapper for API requests
+async function fetchWithRetry(url, options, getProxyUrl, maxRetries = 3) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            const res = await gotScraping({
+                url,
+                headers: getStealthHeaders(),
+                throwHttpErrors: false,
+                proxyUrl: await getProxyUrl(),
+                ...options,
+            });
+
+            if (res.statusCode < 400) {
+                return res;
+            }
+
+            if (res.statusCode >= 500 && attempt < maxRetries) {
+                log.debug(`HTTP ${res.statusCode}, retry ${attempt}/${maxRetries}`);
+                await sleep(500 * attempt);
+                continue;
+            }
+
+            return res;
+        } catch (err) {
+            const msg = err.message || '';
+            if ((msg.includes('595') || msg.includes('ECONNRESET') || msg.includes('proxy')) && attempt < maxRetries) {
+                log.debug(`Proxy error, retry ${attempt}/${maxRetries}`);
+                await sleep(500 * attempt);
+                continue;
+            }
+            if (attempt >= maxRetries) throw err;
+        }
+    }
+}
+
 async function collectFromApi({
     searchParams,
     maxPages,
@@ -140,32 +168,30 @@ async function collectFromApi({
 
     while (saved < resultsWanted && page <= maxPages) {
         const params = { ...searchParams, page };
-        const headers = getStealthHeaders();
 
         let json;
         try {
-            const res = await gotScraping({
-                url: endpoint,
-                headers,
-                searchParams: params,
-                throwHttpErrors: false,
-                proxyUrl: await getProxyUrl(),
-            });
+            const res = await fetchWithRetry(endpoint, { searchParams: params }, getProxyUrl, 5);
 
-            if (res.statusCode >= 400) {
-                log.warning(`API HTTP ${res.statusCode} on page ${page}`);
-                break;
+            if (!res || res.statusCode >= 400) {
+                log.warning(`API HTTP ${res?.statusCode || 'unknown'} on page ${page}`);
+                // Try next page instead of breaking
+                page += 1;
+                continue;
             }
 
             json = safeJsonParse(res.body);
 
             if (!json || typeof json !== 'object') {
                 log.warning(`API non-JSON response on page ${page}`);
-                break;
+                page += 1;
+                continue;
             }
         } catch (err) {
             log.warning(`API request failed page=${page}: ${err.message}`);
-            break;
+            // Try next page instead of breaking
+            page += 1;
+            continue;
         }
 
         const data = Array.isArray(json?.data) ? json.data : [];
@@ -176,34 +202,31 @@ async function collectFromApi({
 
         log.info(`Page ${page}: fetching details for ${data.length} jobs`);
 
-        // MAXIMUM concurrency for speed - process all jobs at once!
+        // Fetch all job details in parallel
         const results = await Promise.all(
             data.map(async (job) => {
                 try {
-                    // Fetch full job details to get complete description and all fields
-                    const detailRes = await gotScraping({
-                        url: `${BASE}/api/v1/jobs/${job.id}`,
-                        headers: getStealthHeaders(),
-                        throwHttpErrors: false,
-                        proxyUrl: await getProxyUrl(),
-                    });
+                    const detailRes = await fetchWithRetry(
+                        `${BASE}/api/v1/jobs/${job.id}`,
+                        {},
+                        getProxyUrl,
+                        2
+                    );
 
-                    if (detailRes.statusCode < 400) {
+                    if (detailRes && detailRes.statusCode < 400) {
                         const detailJson = safeJsonParse(detailRes.body, {});
                         const detail = detailJson?.data || {};
                         return mapApiJob(job, detail);
                     }
 
-                    // Fallback to listing data if detail fails
                     return mapApiJob(job, {});
                 } catch (err) {
-                    log.debug(`Failed to fetch detail for job ${job.id}: ${err.message}`);
+                    log.debug(`Failed detail for job ${job.id}`);
                     return mapApiJob(job, {});
                 }
             })
         );
 
-        // Save all results
         for (const item of results) {
             if (saved >= resultsWanted) break;
             const key = item.url || item.id || JSON.stringify(item);
@@ -254,28 +277,23 @@ await Actor.main(async () => {
         log.warning('Proxy configuration failed. Running without proxy.');
     }
 
-    // Proxy rotation function
     const getProxyUrl = async () => proxyConf ? await proxyConf.newUrl() : undefined;
 
     const seen = new Set();
 
-    // Build search params
     const searchParams = {
         locale: 'en',
         sort,
         keywords,
     };
 
-    // Add location if provided
     if (location) {
         searchParams.city_state_zip = location;
     }
 
-    // Add remote filter if provided
     if (remote === 'remote') searchParams.location_remote_option_filter = 'remote';
     if (remote === 'hybrid') searchParams.location_remote_option_filter = 'hybrid';
 
-    // Collect from API with full details
     const totalSaved = await collectFromApi({
         searchParams,
         maxPages: MAX_PAGES,
