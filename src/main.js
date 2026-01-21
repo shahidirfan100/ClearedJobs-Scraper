@@ -2,24 +2,42 @@ import { Actor, log } from 'apify';
 import { Dataset } from 'crawlee';
 import { gotScraping } from 'got-scraping';
 import * as cheerio from 'cheerio';
+import { HeaderGenerator } from 'header-generator';
 
 const BASE = 'https://clearedjobs.net';
-const DEFAULT_HEADERS = {
-    'user-agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'accept-language': 'en-US,en;q=0.5',
-    'accept-encoding': 'gzip, deflate, br',
-    'cache-control': 'max-age=0',
-    'upgrade-insecure-requests': '1',
-    'sec-fetch-dest': 'document',
-    'sec-fetch-mode': 'navigate',
-    'sec-fetch-site': 'none',
-    'sec-fetch-user': '?1',
-};
 
-// Stealth delay helper
-function randomDelay(min = 100, max = 500) {
+// Production-ready header generator for stealth
+const headerGenerator = new HeaderGenerator({
+    browsers: [
+        { name: 'chrome', minVersion: 120, maxVersion: 130 },
+        { name: 'firefox', minVersion: 115, maxVersion: 125 }
+    ],
+    devices: ['desktop'],
+    operatingSystems: ['windows', 'macos'],
+    locales: ['en-US'],
+});
+
+// Generate fresh stealth headers
+function getStealthHeaders() {
+    const headers = headerGenerator.getHeaders();
+    return {
+        ...headers,
+        'sec-ch-ua': '"Chromium";v="122", "Google Chrome";v="122"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        'sec-fetch-dest': 'document',
+        'sec-fetch-mode': 'navigate',
+        'sec-fetch-site': 'none',
+        'sec-fetch-user': '?1',
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'accept-language': 'en-US,en;q=0.9',
+        'cache-control': 'max-age=0',
+        'upgrade-insecure-requests': '1',
+    };
+}
+
+// Balanced delay helper
+function randomDelay(min = 200, max = 800) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
@@ -200,13 +218,13 @@ function mapJsonLdJob(ld) {
     };
 }
 
-async function fetchJobPage(url, clientOpts) {
+async function fetchJobPage(url, getProxyUrl) {
     try {
         const res = await gotScraping({
             url,
-            headers: DEFAULT_HEADERS,
+            headers: getStealthHeaders(),
             throwHttpErrors: false,
-            ...clientOpts,
+            proxyUrl: await getProxyUrl(),
         });
 
         if (res.statusCode >= 400) {
@@ -250,25 +268,26 @@ async function collectFromApi({
     resultsWanted,
     seen,
     dataset,
-    clientOpts,
+    getProxyUrl,
 }) {
     let saved = 0;
     let page = 1;
     const indexFn = typeof routes.index === 'function' ? routes.index : () => `${BASE}/api/v1/jobs`;
     let endpoint = indexFn();
-    const headers = {
-        ...DEFAULT_HEADERS,
-        'x-csrf-token': csrfToken || '',
-    };
 
     async function fetchDetails(jobId) {
         const results = { detail: {}, additional: {} };
+        const headers = {
+            ...getStealthHeaders(),
+            'x-csrf-token': csrfToken || '',
+        };
+
         try {
             const res = await gotScraping({
                 url: routes.show({ job: jobId }),
                 headers,
                 throwHttpErrors: false,
-                ...clientOpts,
+                proxyUrl: await getProxyUrl(),
             });
             if (res.statusCode < 400) {
                 const json = safeJsonParse(res.body, {});
@@ -277,7 +296,6 @@ async function collectFromApi({
                 log.debug(`Job detail HTTP ${res.statusCode} for ${jobId}`);
             }
         } catch (err) {
-            // Handle proxy/network errors gracefully
             const errorMsg = err.message || String(err);
             if (errorMsg.includes('ECONNRESET') || errorMsg.includes('proxy') || errorMsg.includes('595')) {
                 log.debug(`Network/proxy error fetching job detail ${jobId}`);
@@ -291,7 +309,7 @@ async function collectFromApi({
                 url: routes.additional({ job: jobId }),
                 headers,
                 throwHttpErrors: false,
-                ...clientOpts,
+                proxyUrl: await getProxyUrl(),
             });
             if (res.statusCode < 400) {
                 const json = safeJsonParse(res.body, {});
@@ -300,7 +318,6 @@ async function collectFromApi({
                 log.debug(`Job additional HTTP ${res.statusCode} for ${jobId}`);
             }
         } catch (err) {
-            // Handle proxy/network errors gracefully
             const errorMsg = err.message || String(err);
             if (errorMsg.includes('ECONNRESET') || errorMsg.includes('proxy') || errorMsg.includes('595')) {
                 log.debug(`Network/proxy error fetching job additional ${jobId}`);
@@ -314,6 +331,11 @@ async function collectFromApi({
 
     while (saved < resultsWanted && page <= maxPages) {
         const params = { ...searchParams, page };
+        const headers = {
+            ...getStealthHeaders(),
+            'x-csrf-token': csrfToken || '',
+        };
+
         let json;
         let attempt = 0;
         while (attempt < 3 && !json) {
@@ -324,7 +346,7 @@ async function collectFromApi({
                     headers,
                     searchParams: params,
                     throwHttpErrors: false,
-                    ...clientOpts,
+                    proxyUrl: await getProxyUrl(),
                 });
                 const contentType = res.headers['content-type'] || '';
                 if (res.statusCode >= 500) {
@@ -341,7 +363,6 @@ async function collectFromApi({
                 }
             } catch (err) {
                 const errorMsg = err.message || String(err);
-                // Handle proxy/network errors gracefully
                 if (errorMsg.includes('ECONNRESET') || errorMsg.includes('proxy') || errorMsg.includes('595')) {
                     log.warning(`Network/proxy error on page ${page} (attempt ${attempt}), retrying...`);
                 } else {
@@ -366,8 +387,9 @@ async function collectFromApi({
             break;
         }
 
+        // Balanced concurrency (8) - middle ground between 5 and 12
+        const CONCURRENCY = 8;
         const batch = [...data];
-        const CONCURRENCY = 12;
         while (batch.length && saved < resultsWanted) {
             const chunk = batch.splice(0, CONCURRENCY);
             const results = await Promise.all(
@@ -385,7 +407,7 @@ async function collectFromApi({
                             !item.salary
                         )
                     ) {
-                        const htmlItem = await fetchJobPage(item.url, clientOpts);
+                        const htmlItem = await fetchJobPage(item.url, getProxyUrl);
                         if (htmlItem) {
                             const existingTextLen = (item.description_text || '').length;
                             const htmlTextLen = (htmlItem.description_text || '').length;
@@ -422,19 +444,23 @@ async function collectFromApi({
         if (!nextLink) break;
         page += 1;
         endpoint = nextLink.startsWith('http') ? nextLink : endpoint;
-        // Small delay between pages for stealth
-        if (page <= maxPages) await sleep(randomDelay(200, 500));
+        // Balanced delay between pages
+        if (page <= maxPages) await sleep(randomDelay(300, 600));
     }
 
     return saved;
 }
 
-async function collectFromSitemaps({ resultsWanted, seen, dataset, clientOpts }) {
+async function collectFromSitemaps({ resultsWanted, seen, dataset, getProxyUrl }) {
     let saved = 0;
     const indexUrl = `${BASE}/sitemap.xml`;
     let sitemapList = [];
     try {
-        const res = await gotScraping({ url: indexUrl, headers: DEFAULT_HEADERS, ...clientOpts });
+        const res = await gotScraping({
+            url: indexUrl,
+            headers: getStealthHeaders(),
+            proxyUrl: await getProxyUrl(),
+        });
         sitemapList = [...res.body.matchAll(/<loc>([^<]+sitemap_[^<]+\.xml)<\/loc>/g)].map(
             (m) => m[1]
         );
@@ -455,9 +481,9 @@ async function collectFromSitemaps({ resultsWanted, seen, dataset, clientOpts })
         try {
             const res = await gotScraping({
                 url: sm,
-                headers: DEFAULT_HEADERS,
+                headers: getStealthHeaders(),
                 throwHttpErrors: false,
-                ...clientOpts,
+                proxyUrl: await getProxyUrl(),
             });
             if (res.statusCode >= 400) {
                 log.warning(`Sitemap ${sm} blocked (${res.statusCode})`);
@@ -476,7 +502,7 @@ async function collectFromSitemaps({ resultsWanted, seen, dataset, clientOpts })
         if (saved >= resultsWanted) break;
         if (seen.has(url)) continue;
         try {
-            const item = await fetchJobPage(url, clientOpts);
+            const item = await fetchJobPage(url, getProxyUrl);
             if (!item) continue;
             await dataset.pushData(item);
             seen.add(url);
@@ -519,7 +545,8 @@ await Actor.main(async () => {
         log.warning('Proxy configuration failed. Running without proxy.');
     }
 
-    const clientOpts = proxyConf ? { proxyUrl: await proxyConf.newUrl() } : {};
+    // Proxy rotation function - new proxy per request for stealth
+    const getProxyUrl = async () => proxyConf ? await proxyConf.newUrl() : undefined;
 
     const seen = new Set();
     let totalSaved = 0;
@@ -532,9 +559,9 @@ await Actor.main(async () => {
         try {
             const response = await gotScraping({
                 url: startUrl || `${BASE}/jobs`,
-                headers: DEFAULT_HEADERS,
+                headers: getStealthHeaders(),
                 throwHttpErrors: false,
-                ...clientOpts,
+                proxyUrl: await getProxyUrl(),
             });
 
             if (response.statusCode === 403) {
@@ -585,7 +612,7 @@ await Actor.main(async () => {
             resultsWanted: RESULTS_WANTED,
             seen,
             dataset,
-            clientOpts,
+            getProxyUrl,
         });
     } catch (err) {
         log.error(`API collection failed: ${err.message}`);
@@ -599,7 +626,7 @@ await Actor.main(async () => {
                 resultsWanted: RESULTS_WANTED - totalSaved,
                 seen,
                 dataset,
-                clientOpts,
+                getProxyUrl,
             });
         } catch (err) {
             log.error(`Sitemap collection failed: ${err.message}`);
