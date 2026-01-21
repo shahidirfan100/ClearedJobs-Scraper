@@ -41,6 +41,12 @@ function randomDelay(min = 500, max = 1500) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
+// Sleep utility function
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+
 function normalizeSpace(text = '') {
     return text.replace(/\s+/g, ' ').trim();
 }
@@ -322,7 +328,7 @@ async function collectFromApi({
                 });
 
                 if (res.statusCode >= 500) {
-                    await Actor.sleep(800 * attempt + randomDelay(100, 300));
+                    await sleep(800 * attempt + randomDelay(100, 300));
                     continue;
                 }
                 json = safeJsonParse(res.body);
@@ -332,7 +338,7 @@ async function collectFromApi({
                 }
             } catch {
                 if (attempt < 3) {
-                    await Actor.sleep(500 * attempt + randomDelay(100, 300));
+                    await sleep(500 * attempt + randomDelay(100, 300));
                 }
             }
         }
@@ -394,7 +400,7 @@ async function collectFromApi({
             }
 
             // Human-like delay between batches
-            await Actor.sleep(randomDelay(300, 800));
+            await sleep(randomDelay(300, 800));
         }
 
         const nextLink = json?.links?.next || null;
@@ -403,7 +409,7 @@ async function collectFromApi({
         endpoint = nextLink.startsWith('http') ? nextLink : endpoint;
 
         // Human-like delay between pages
-        if (page <= maxPages) await Actor.sleep(randomDelay(500, 1200));
+        if (page <= maxPages) await sleep(randomDelay(500, 1200));
     }
 
     return saved;
@@ -456,7 +462,7 @@ async function collectFromSitemaps({ resultsWanted, seen, dataset, getProxyUrl }
             await dataset.pushData(item);
             seen.add(url);
             saved += 1;
-            await Actor.sleep(randomDelay(300, 600));
+            await sleep(randomDelay(300, 600));
         } catch { /* ignore */ }
     }
 
