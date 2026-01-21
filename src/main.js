@@ -2,50 +2,31 @@ import { Actor, log } from 'apify';
 import { Dataset } from 'crawlee';
 import { gotScraping } from 'got-scraping';
 import * as cheerio from 'cheerio';
-import { HeaderGenerator } from 'header-generator';
 
 const BASE = 'https://clearedjobs.net';
+const DEFAULT_HEADERS = {
+    'user-agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'accept-language': 'en-US,en;q=0.5',
+    'accept-encoding': 'gzip, deflate, br',
+    'cache-control': 'max-age=0',
+    'upgrade-insecure-requests': '1',
+    'sec-fetch-dest': 'document',
+    'sec-fetch-mode': 'navigate',
+    'sec-fetch-site': 'none',
+    'sec-fetch-user': '?1',
+};
 
-// Production-ready header generator for stealth
-const headerGenerator = new HeaderGenerator({
-    browsers: [
-        { name: 'chrome', minVersion: 120, maxVersion: 130 },
-        { name: 'firefox', minVersion: 115, maxVersion: 125 }
-    ],
-    devices: ['desktop'],
-    operatingSystems: ['windows', 'macos'],
-    locales: ['en-US'],
-});
-
-// Generate fresh stealth headers
-function getStealthHeaders() {
-    const headers = headerGenerator.getHeaders();
-    return {
-        ...headers,
-        'sec-ch-ua': '"Chromium";v="122", "Google Chrome";v="122"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        'sec-fetch-dest': 'document',
-        'sec-fetch-mode': 'navigate',
-        'sec-fetch-site': 'none',
-        'sec-fetch-user': '?1',
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'accept-language': 'en-US,en;q=0.9',
-        'cache-control': 'max-age=0',
-        'upgrade-insecure-requests': '1',
-    };
-}
-
-// Human-like delay helper
-function randomDelay(min = 500, max = 1500) {
+// Stealth delay helper
+function randomDelay(min = 100, max = 500) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-// Sleep utility function
+// Sleep utility function (fix for Actor.sleep bug)
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
-
 
 function normalizeSpace(text = '') {
     return text.replace(/\s+/g, ' ').trim();
@@ -132,7 +113,7 @@ function extractJobType(job, detail, additional) {
     );
 }
 
-function mapApiJob(job, detail = {}, additional = {}) {
+function mapApiJob(job, detail = {}, additional = {}, source = 'api') {
     const rawUrl =
         job.url || detail.url || additional.url || (job.id ? `${BASE}/job/${job.id}` : null);
     const id = job.id ?? detail.id ?? additional.id ?? null;
@@ -166,6 +147,7 @@ function mapApiJob(job, detail = {}, additional = {}) {
         null;
 
     return {
+        source,
         id,
         url: url || null,
         title: normalizeSpace(job.title || job.job_title || ''),
@@ -193,6 +175,7 @@ function mapApiJob(job, detail = {}, additional = {}) {
 function mapJsonLdJob(ld) {
     const url = ld.url ? new URL(ld.url, BASE).href : null;
     return {
+        source: 'jsonld',
         id: ld.identifier || null,
         url,
         title: normalizeSpace(ld.title || ''),
@@ -217,16 +200,17 @@ function mapJsonLdJob(ld) {
     };
 }
 
-async function fetchJobPage(url, getProxyUrl) {
+async function fetchJobPage(url, clientOpts) {
     try {
         const res = await gotScraping({
             url,
-            headers: getStealthHeaders(),
+            headers: DEFAULT_HEADERS,
             throwHttpErrors: false,
-            proxyUrl: await getProxyUrl(),
+            ...clientOpts,
         });
 
         if (res.statusCode >= 400) {
+            log.warning(`Job page blocked (${res.statusCode}) for ${url}`);
             return null;
         }
 
@@ -244,6 +228,7 @@ async function fetchJobPage(url, getProxyUrl) {
         const descText = descHtml ? normalizeSpace(cheerio.load(descHtml).text()) : null;
 
         return {
+            source: 'html',
             url,
             title,
             company,
@@ -251,7 +236,8 @@ async function fetchJobPage(url, getProxyUrl) {
             description_html: descHtml,
             description_text: descText,
         };
-    } catch {
+    } catch (err) {
+        log.warning(`Failed to fetch job page ${url}: ${err.message}`);
         return null;
     }
 }
@@ -264,56 +250,70 @@ async function collectFromApi({
     resultsWanted,
     seen,
     dataset,
-    getProxyUrl,
+    clientOpts,
 }) {
     let saved = 0;
     let page = 1;
     const indexFn = typeof routes.index === 'function' ? routes.index : () => `${BASE}/api/v1/jobs`;
     let endpoint = indexFn();
+    const headers = {
+        ...DEFAULT_HEADERS,
+        'x-csrf-token': csrfToken || '',
+    };
 
     async function fetchDetails(jobId) {
         const results = { detail: {}, additional: {} };
-        const headers = {
-            ...getStealthHeaders(),
-            'x-csrf-token': csrfToken || '',
-        };
-
         try {
             const res = await gotScraping({
                 url: routes.show({ job: jobId }),
                 headers,
                 throwHttpErrors: false,
-                proxyUrl: await getProxyUrl(),
+                ...clientOpts,
             });
             if (res.statusCode < 400) {
                 const json = safeJsonParse(res.body, {});
                 results.detail = json?.data || json || {};
+            } else if (res.statusCode >= 500) {
+                log.debug(`Job detail HTTP ${res.statusCode} for ${jobId}`);
             }
-        } catch { /* ignore */ }
+        } catch (err) {
+            // Handle proxy/network errors gracefully
+            const errorMsg = err.message || String(err);
+            if (errorMsg.includes('ECONNRESET') || errorMsg.includes('proxy') || errorMsg.includes('595')) {
+                log.debug(`Network/proxy error fetching job detail ${jobId}`);
+            } else {
+                log.debug(`Job detail fetch failed for ${jobId}: ${errorMsg}`);
+            }
+        }
 
         try {
             const res = await gotScraping({
                 url: routes.additional({ job: jobId }),
                 headers,
                 throwHttpErrors: false,
-                proxyUrl: await getProxyUrl(),
+                ...clientOpts,
             });
             if (res.statusCode < 400) {
                 const json = safeJsonParse(res.body, {});
                 results.additional = json?.data || json || {};
+            } else if (res.statusCode >= 500) {
+                log.debug(`Job additional HTTP ${res.statusCode} for ${jobId}`);
             }
-        } catch { /* ignore */ }
+        } catch (err) {
+            // Handle proxy/network errors gracefully
+            const errorMsg = err.message || String(err);
+            if (errorMsg.includes('ECONNRESET') || errorMsg.includes('proxy') || errorMsg.includes('595')) {
+                log.debug(`Network/proxy error fetching job additional ${jobId}`);
+            } else {
+                log.debug(`Job additional fetch failed for ${jobId}: ${errorMsg}`);
+            }
+        }
 
         return results;
     }
 
     while (saved < resultsWanted && page <= maxPages) {
         const params = { ...searchParams, page };
-        const headers = {
-            ...getStealthHeaders(),
-            'x-csrf-token': csrfToken || '',
-        };
-
         let json;
         let attempt = 0;
         while (attempt < 3 && !json) {
@@ -324,19 +324,30 @@ async function collectFromApi({
                     headers,
                     searchParams: params,
                     throwHttpErrors: false,
-                    proxyUrl: await getProxyUrl(),
+                    ...clientOpts,
                 });
-
+                const contentType = res.headers['content-type'] || '';
                 if (res.statusCode >= 500) {
+                    log.warning(`API HTTP ${res.statusCode} on page ${page}, retry ${attempt}`);
                     await sleep(800 * attempt + randomDelay(100, 300));
                     continue;
                 }
                 json = safeJsonParse(res.body);
 
                 if (!json || typeof json !== 'object') {
+                    log.warning(`API non-JSON response on page ${page}`);
+                    log.debug(`Content-Type: ${contentType}, Body snippet: ${res.body?.slice?.(0, 200) || ''}`);
                     break;
                 }
-            } catch {
+            } catch (err) {
+                const errorMsg = err.message || String(err);
+                // Handle proxy/network errors gracefully
+                if (errorMsg.includes('ECONNRESET') || errorMsg.includes('proxy') || errorMsg.includes('595')) {
+                    log.warning(`Network/proxy error on page ${page} (attempt ${attempt}), retrying...`);
+                } else {
+                    log.warning(`API request failed page=${page} (attempt ${attempt}): ${errorMsg}`);
+                }
+
                 if (attempt < 3) {
                     await sleep(500 * attempt + randomDelay(100, 300));
                 }
@@ -350,39 +361,44 @@ async function collectFromApi({
             : Array.isArray(json?.jobs)
                 ? json.jobs
                 : [];
-        if (!data.length) break;
+        if (!data.length) {
+            log.warning(`Page ${page}: no jobs found`);
+            break;
+        }
 
-        // Process jobs with reduced concurrency for stealth
-        const CONCURRENCY = 5;
         const batch = [...data];
+        const CONCURRENCY = 12;
         while (batch.length && saved < resultsWanted) {
             const chunk = batch.splice(0, CONCURRENCY);
             const results = await Promise.all(
                 chunk.map(async (job) => {
                     const { detail, additional } = await fetchDetails(job.id);
-                    const item = mapApiJob(job, detail, additional);
-
-                    // Enrich with HTML if missing critical data
+                    const item = mapApiJob(job, detail, additional, 'api');
                     if (
                         item.url &&
                         !seen.has(item.url) &&
                         (
                             (!item.description_html || (item.description_text || '').length < 500) ||
                             !item.job_type ||
-                            !item.security_clearance
+                            !item.security_clearance ||
+                            !item.location ||
+                            !item.salary
                         )
                     ) {
-                        const htmlItem = await fetchJobPage(item.url, getProxyUrl);
+                        const htmlItem = await fetchJobPage(item.url, clientOpts);
                         if (htmlItem) {
                             const existingTextLen = (item.description_text || '').length;
                             const htmlTextLen = (htmlItem.description_text || '').length;
                             if (!item.description_html || htmlTextLen > existingTextLen) {
-                                item.description_html = htmlItem.description_html || item.description_html;
-                                item.description_text = htmlItem.description_text || item.description_text;
+                                item.description_html =
+                                    htmlItem.description_html || item.description_html;
+                                item.description_text =
+                                    htmlItem.description_text || item.description_text;
                             }
                             item.job_type = item.job_type || htmlItem.job_type || null;
                             item.location = item.location || htmlItem.location || null;
-                            item.security_clearance = item.security_clearance || htmlItem.security_clearance || null;
+                            item.security_clearance =
+                                item.security_clearance || htmlItem.security_clearance || null;
                             item.salary = item.salary || htmlItem.salary || null;
                         }
                     }
@@ -397,44 +413,41 @@ async function collectFromApi({
                 seen.add(key);
                 await dataset.pushData(item);
                 saved += 1;
+                // Small random delay for stealth
+                await sleep(randomDelay(50, 150));
             }
-
-            // Human-like delay between batches
-            await sleep(randomDelay(300, 800));
         }
 
         const nextLink = json?.links?.next || null;
         if (!nextLink) break;
         page += 1;
         endpoint = nextLink.startsWith('http') ? nextLink : endpoint;
-
-        // Human-like delay between pages
-        if (page <= maxPages) await sleep(randomDelay(500, 1200));
+        // Small delay between pages for stealth
+        if (page <= maxPages) await sleep(randomDelay(200, 500));
     }
 
     return saved;
 }
 
-async function collectFromSitemaps({ resultsWanted, seen, dataset, getProxyUrl }) {
+async function collectFromSitemaps({ resultsWanted, seen, dataset, clientOpts }) {
     let saved = 0;
     const indexUrl = `${BASE}/sitemap.xml`;
     let sitemapList = [];
-
     try {
-        const res = await gotScraping({
-            url: indexUrl,
-            headers: getStealthHeaders(),
-            proxyUrl: await getProxyUrl(),
-        });
+        const res = await gotScraping({ url: indexUrl, headers: DEFAULT_HEADERS, ...clientOpts });
         sitemapList = [...res.body.matchAll(/<loc>([^<]+sitemap_[^<]+\.xml)<\/loc>/g)].map(
             (m) => m[1]
         );
-    } catch {
+    } catch (err) {
+        log.warning(`Failed to fetch sitemap index: ${err.message}`);
         return saved;
     }
 
     const jobSitemaps = sitemapList.filter((u) => u.includes('sitemap_active_jobs'));
-    if (!jobSitemaps.length) return saved;
+    if (!jobSitemaps.length) {
+        log.warning('No job sitemaps discovered in sitemap index.');
+        return saved;
+    }
 
     const urls = [];
     for (const sm of jobSitemaps) {
@@ -442,28 +455,35 @@ async function collectFromSitemaps({ resultsWanted, seen, dataset, getProxyUrl }
         try {
             const res = await gotScraping({
                 url: sm,
-                headers: getStealthHeaders(),
+                headers: DEFAULT_HEADERS,
                 throwHttpErrors: false,
-                proxyUrl: await getProxyUrl(),
+                ...clientOpts,
             });
-            if (res.statusCode >= 400) continue;
+            if (res.statusCode >= 400) {
+                log.warning(`Sitemap ${sm} blocked (${res.statusCode})`);
+                continue;
+            }
             urls.push(
                 ...[...res.body.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]).slice(0, resultsWanted)
             );
-        } catch { /* ignore */ }
+        } catch (err) {
+            log.warning(`Failed to fetch sitemap ${sm}: ${err.message}`);
+        }
     }
+    log.info(`Found ${urls.length} URLs from sitemap`);
 
     for (const url of urls) {
         if (saved >= resultsWanted) break;
         if (seen.has(url)) continue;
         try {
-            const item = await fetchJobPage(url, getProxyUrl);
+            const item = await fetchJobPage(url, clientOpts);
             if (!item) continue;
             await dataset.pushData(item);
             seen.add(url);
             saved += 1;
-            await sleep(randomDelay(300, 600));
-        } catch { /* ignore */ }
+        } catch (err) {
+            log.warning(`Failed to parse job ${url}: ${err.message}`);
+        }
     }
 
     return saved;
@@ -478,30 +498,33 @@ await Actor.main(async () => {
         location = '',
         sort = 'date',
         remote = '',
-        results_wanted: RESULTS_WANTED_RAW = 20,
-        max_pages: MAX_PAGES_RAW = 3,
+        results_wanted: RESULTS_WANTED_RAW = 50,
+        max_pages: MAX_PAGES_RAW = 5,
         proxyConfiguration,
     } = input;
 
     const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW)
         ? Math.max(1, +RESULTS_WANTED_RAW)
-        : 20;
-    const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 3;
+        : 50;
+    const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 5;
 
-    log.info(`Starting scraper: target ${RESULTS_WANTED} jobs, max ${MAX_PAGES} pages`);
+    log.info(`Scraper started - target: ${RESULTS_WANTED} jobs, max ${MAX_PAGES} pages`);
 
     const dataset = await Dataset.open();
     const proxyConf = proxyConfiguration
         ? await Actor.createProxyConfiguration(proxyConfiguration)
         : await Actor.createProxyConfiguration({ useApifyProxy: true });
 
-    // Proxy rotation function - new proxy per request
-    const getProxyUrl = async () => proxyConf ? await proxyConf.newUrl() : undefined;
+    if (!proxyConf) {
+        log.warning('Proxy configuration failed. Running without proxy.');
+    }
+
+    const clientOpts = proxyConf ? { proxyUrl: await proxyConf.newUrl() } : {};
 
     const seen = new Set();
     let totalSaved = 0;
 
-    // Discover routes + CSRF token
+    // 1) Discover routes + CSRF token
     let searchPageHtml;
     let attempt = 0;
     while (attempt < 3 && !searchPageHtml) {
@@ -509,13 +532,14 @@ await Actor.main(async () => {
         try {
             const response = await gotScraping({
                 url: startUrl || `${BASE}/jobs`,
-                headers: getStealthHeaders(),
+                headers: DEFAULT_HEADERS,
                 throwHttpErrors: false,
-                proxyUrl: await getProxyUrl(),
+                ...clientOpts,
             });
 
             if (response.statusCode === 403) {
-                await Actor.sleep(1000 * attempt + randomDelay(200, 500));
+                log.warning(`HTTP 403 - retrying search page (attempt ${attempt}/3)...`);
+                await sleep(1000 * attempt + randomDelay(100, 400));
                 continue;
             }
 
@@ -526,9 +550,10 @@ await Actor.main(async () => {
             searchPageHtml = response.body;
         } catch (err) {
             if (attempt < 3) {
-                await Actor.sleep(1000 * attempt + randomDelay(200, 500));
+                log.warning(`Failed to fetch search page (attempt ${attempt}/3): ${err.message}`);
+                await sleep(1000 * attempt + randomDelay(100, 400));
             } else {
-                throw new Error(`Failed to load search page: ${err.message}`);
+                throw new Error(`Unable to fetch search page after ${attempt} attempts: ${err.message}`);
             }
         }
     }
@@ -540,7 +565,7 @@ await Actor.main(async () => {
     const csrfToken = extractCsrf(searchPageHtml);
     const routes = buildRouteResolver(searchPageHtml);
 
-    // Build search params
+    // 2) Build search params
     const searchParams = {
         locale: 'en',
         sort,
@@ -550,7 +575,7 @@ await Actor.main(async () => {
     if (remote === 'remote') searchParams.location_remote_option_filter = 'remote';
     if (remote === 'hybrid') searchParams.location_remote_option_filter = 'hybrid';
 
-    // Collect from API (primary method - fast)
+    // 3) Collect from API
     try {
         totalSaved += await collectFromApi({
             routes,
@@ -560,25 +585,26 @@ await Actor.main(async () => {
             resultsWanted: RESULTS_WANTED,
             seen,
             dataset,
-            getProxyUrl,
+            clientOpts,
         });
     } catch (err) {
-        log.warning(`API collection issue: ${err.message}`);
+        log.error(`API collection failed: ${err.message}`);
+        // Continue to fallback methods
     }
 
-    // Fallback to sitemap/HTML if needed
+    // 3) Fallback to sitemap/HTML if needed
     if (totalSaved < RESULTS_WANTED) {
         try {
             totalSaved += await collectFromSitemaps({
                 resultsWanted: RESULTS_WANTED - totalSaved,
                 seen,
                 dataset,
-                getProxyUrl,
+                clientOpts,
             });
         } catch (err) {
-            log.warning(`Sitemap fallback issue: ${err.message}`);
+            log.error(`Sitemap collection failed: ${err.message}`);
         }
     }
 
-    log.info(`Completed: scraped ${totalSaved} jobs`);
+    log.info(`Done - scraped ${totalSaved} jobs`);
 });
