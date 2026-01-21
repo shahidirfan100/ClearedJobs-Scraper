@@ -36,11 +36,6 @@ function getStealthHeaders() {
     };
 }
 
-// Sleep utility function
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 function normalizeSpace(text = '') {
     return text.replace(/\s+/g, ' ').trim();
 }
@@ -53,81 +48,28 @@ function safeJsonParse(value, fallback = null) {
     }
 }
 
-function extractFromBlocks(blocks, label) {
-    if (!Array.isArray(blocks)) return null;
-    const target = normalizeSpace(label || '').toLowerCase();
-    const block = blocks.find(
-        (b) =>
-            normalizeSpace(b?.label || '').toLowerCase() === target ||
-            normalizeSpace(b?.title || '').toLowerCase() === target
-    );
-    return block?.value ? normalizeSpace(block.value) : null;
-}
-
-function mapApiJob(job, detail = {}) {
-    const id = job.id ?? detail.id ?? null;
-    let url = job.url || detail.url || (id ? `${BASE}/job/${id}` : null);
+function mapApiJob(job) {
+    const id = job.id || null;
+    let url = job.url || (id ? `${BASE}/job/${id}` : null);
     if (url) url = new URL(url, BASE).href;
 
-    // Extract description from API
-    const descriptionHtml = detail.description || job.description || null;
-
-    // Extract from JSON-LD if available
-    const jsonLd = detail.jsonLd || {};
-
-    // Extract from customBlockBottom for security clearance
-    const customBlocks = detail.customBlockBottom || detail.customBlockList || [];
-    const clearanceFromBlocks = extractFromBlocks(customBlocks, 'Security Clearance');
-
-    // Extract location - prioritize API fields
-    const location = normalizeSpace(
-        detail.location ||
-        job.location ||
-        jsonLd.jobLocation?.address?.addressLocality ||
-        jsonLd.jobLocation?.address?.addressRegion ||
-        ''
-    );
-
-    // Extract salary
-    const salary = detail.salary ||
-        job.salary ||
-        jsonLd.baseSalary?.value?.value ||
-        null;
-
-    // Extract security clearance
-    const security_clearance = clearanceFromBlocks ||
-        detail.security_clearance ||
-        job.security_clearance ||
-        jsonLd.industry ||
-        null;
-
-    // Extract job type
-    const job_type = detail.position_type ||
-        detail.job_type ||
-        detail.employment_type ||
-        job.position_type ||
-        job.job_type ||
-        (Array.isArray(jsonLd.employmentType) ? jsonLd.employmentType.join(', ') : jsonLd.employmentType) ||
-        null;
+    // Extract data directly from listing API
+    const description = job.description || job.shortDescription || job.body || null;
 
     return {
         id,
         url: url || null,
-        title: normalizeSpace(job.title || job.job_title || jsonLd.title || ''),
-        company: normalizeSpace(job.company?.name || job.company || detail.company?.name || jsonLd.hiringOrganization?.name || ''),
-        location,
-        security_clearance,
-        salary: salary ? String(salary) : null,
-        job_type,
-        date_posted: job.posted_date || job.modified_time || job.created_at || detail.time || jsonLd.datePosted || null,
-        description_html: descriptionHtml,
-        description_text: descriptionHtml
-            ? normalizeSpace(cheerio.load(descriptionHtml).text())
-            : job.shortDescription
-                ? normalizeSpace(job.shortDescription)
-                : jsonLd.description
-                    ? normalizeSpace(jsonLd.description)
-                    : null,
+        title: normalizeSpace(job.title || job.job_title || ''),
+        company: normalizeSpace(job.company?.name || job.company || ''),
+        location: normalizeSpace(job.location || ''),
+        security_clearance: job.security_clearance || job.clearance || null,
+        salary: job.salary || job.salary_min || job.salary_max || null,
+        job_type: job.job_type || job.position_type || job.employment_type || null,
+        date_posted: job.posted_date || job.modified_time || job.created_at || job.date || null,
+        description_html: description,
+        description_text: description
+            ? normalizeSpace(cheerio.load(description).text())
+            : null,
     };
 }
 
@@ -179,49 +121,20 @@ async function collectFromApi({
             break;
         }
 
-        log.info(`Page ${page}: found ${data.length} jobs`);
+        log.info(`Page ${page}: processing ${data.length} jobs`);
 
-        // Maximum concurrency for speed - API can handle it!
-        const CONCURRENCY = 25;
-        const batch = [...data];
+        // Process all jobs from listing API directly - NO detail API calls!
+        for (const job of data) {
+            if (saved >= resultsWanted) break;
 
-        while (batch.length && saved < resultsWanted) {
-            const chunk = batch.splice(0, CONCURRENCY);
+            const item = mapApiJob(job);
+            const key = item.url || item.id || JSON.stringify(item);
 
-            // Fetch all details in parallel - NO delays between requests
-            const results = await Promise.all(
-                chunk.map(async (job) => {
-                    try {
-                        const detailRes = await gotScraping({
-                            url: `${BASE}/api/v1/jobs/${job.id}`,
-                            headers: getStealthHeaders(),
-                            throwHttpErrors: false,
-                            proxyUrl: await getProxyUrl(),
-                        });
+            if (!key || seen.has(key)) continue;
 
-                        if (detailRes.statusCode < 400) {
-                            const detailJson = safeJsonParse(detailRes.body, {});
-                            const detail = detailJson?.data || {};
-                            return mapApiJob(job, detail);
-                        }
-
-                        return mapApiJob(job, {});
-                    } catch (err) {
-                        log.debug(`Failed to fetch detail for job ${job.id}: ${err.message}`);
-                        return mapApiJob(job, {});
-                    }
-                })
-            );
-
-            // Save all results from this batch
-            for (const item of results) {
-                if (saved >= resultsWanted) break;
-                const key = item.url || item.id || JSON.stringify(item);
-                if (!key || seen.has(key)) continue;
-                seen.add(key);
-                await dataset.pushData(item);
-                saved += 1;
-            }
+            seen.add(key);
+            await dataset.pushData(item);
+            saved += 1;
         }
 
         log.info(`Progress: ${saved}/${resultsWanted} jobs collected`);
