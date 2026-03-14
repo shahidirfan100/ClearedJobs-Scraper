@@ -53,6 +53,67 @@ function safeJsonParse(value, fallback = null) {
     }
 }
 
+function normalizeUrl(value) {
+    if (!value) return null;
+    try {
+        const parsed = new URL(value, BASE);
+        parsed.hash = '';
+        parsed.searchParams.delete('ref');
+        return parsed.href;
+    } catch {
+        return null;
+    }
+}
+
+function compactValue(value) {
+    if (value === null || value === undefined) return undefined;
+
+    if (typeof value === 'string') {
+        const normalized = normalizeSpace(value);
+        return normalized ? normalized : undefined;
+    }
+
+    if (Array.isArray(value)) {
+        const cleaned = value
+            .map((entry) => compactValue(entry))
+            .filter((entry) => entry !== undefined);
+        return cleaned.length ? cleaned : undefined;
+    }
+
+    if (typeof value === 'object') {
+        const cleaned = {};
+        for (const [key, entry] of Object.entries(value)) {
+            const compacted = compactValue(entry);
+            if (compacted !== undefined) cleaned[key] = compacted;
+        }
+        return Object.keys(cleaned).length ? cleaned : undefined;
+    }
+
+    return value;
+}
+
+function compactRecord(record) {
+    return compactValue(record) || {};
+}
+
+function parseJsonLd(input) {
+    if (!input) return {};
+
+    if (typeof input === 'string') {
+        const parsed = safeJsonParse(input, {});
+        if (Array.isArray(parsed)) {
+            return parsed.find((entry) => entry && typeof entry === 'object') || {};
+        }
+        return parsed && typeof parsed === 'object' ? parsed : {};
+    }
+
+    if (Array.isArray(input)) {
+        return input.find((entry) => entry && typeof entry === 'object') || {};
+    }
+
+    return typeof input === 'object' ? input : {};
+}
+
 function extractFromBlocks(blocks, label) {
     if (!Array.isArray(blocks)) return null;
     const target = normalizeSpace(label || '').toLowerCase();
@@ -64,15 +125,75 @@ function extractFromBlocks(blocks, label) {
     return block?.value ? normalizeSpace(block.value) : null;
 }
 
+function buildDedupKey(item) {
+    if (item?.id !== null && item?.id !== undefined) {
+        return `id:${String(item.id)}`;
+    }
+
+    const normalizedItemUrl = normalizeUrl(item?.url);
+    if (normalizedItemUrl) {
+        return `url:${normalizedItemUrl.toLowerCase()}`;
+    }
+
+    const title = normalizeSpace(item?.title || '').toLowerCase();
+    const company = normalizeSpace(item?.company || '').toLowerCase();
+    const location = normalizeSpace(item?.location || '').toLowerCase();
+    if (title || company || location) {
+        return `tcl:${title}|${company}|${location}`;
+    }
+
+    return null;
+}
+
+function buildSearchParams({ startUrl, keywords, location, sort, remote }) {
+    const params = {
+        locale: 'en',
+        sort,
+        keywords,
+    };
+
+    if (location) {
+        params.city_state_zip = location;
+    }
+
+    if (remote === 'remote' || remote === 'hybrid') {
+        params.location_remote_option_filter = remote;
+    }
+
+    if (!startUrl) return params;
+
+    try {
+        const parsed = new URL(startUrl, BASE);
+        const sp = parsed.searchParams;
+
+        if (sp.has('keywords')) params.keywords = sp.get('keywords') || '';
+        if (sp.has('city_state_zip')) params.city_state_zip = sp.get('city_state_zip') || '';
+        if (sp.has('sort')) params.sort = sp.get('sort') || params.sort;
+        if (sp.has('locale')) params.locale = sp.get('locale') || params.locale;
+        if (sp.has('location_remote_option_filter')) {
+            params.location_remote_option_filter = sp.get('location_remote_option_filter') || '';
+        }
+    } catch (err) {
+        log.warning(`Invalid startUrl provided, using filter params instead: ${err.message}`);
+    }
+
+    return params;
+}
+
 function mapApiJob(job, detail = {}) {
     const id = job.id ?? detail.id ?? null;
-    let url = job.url || detail.url || (id ? `${BASE}/job/${id}` : null);
-    if (url) url = new URL(url, BASE).href;
+    const url = normalizeUrl(job.url || detail.url || (id ? `${BASE}/job/${id}` : null));
 
     const descriptionHtml = detail.description || job.description || null;
-    const jsonLd = detail.jsonLd || {};
-    const customBlocks = detail.customBlockBottom || detail.customBlockList || [];
+    const jsonLd = parseJsonLd(detail.jsonLd || job.jsonLd);
+    const customBlocks = [
+        ...(Array.isArray(detail.customBlockBottom) ? detail.customBlockBottom : []),
+        ...(Array.isArray(detail.customBlockTop) ? detail.customBlockTop : []),
+        ...(Array.isArray(job.customBlockList) ? job.customBlockList : []),
+    ];
     const clearanceFromBlocks = extractFromBlocks(customBlocks, 'Security Clearance');
+    const postedFromBlocks = extractFromBlocks(customBlocks, 'Posted');
+    const jobReferenceId = extractFromBlocks(customBlocks, 'Job Reference ID');
 
     const location = normalizeSpace(
         detail.location ||
@@ -83,6 +204,12 @@ function mapApiJob(job, detail = {}) {
     );
 
     const salary = detail.salary || job.salary || jsonLd.baseSalary?.value?.value || null;
+    const companyRaw = detail.company || job.company || null;
+    const companyName = normalizeSpace(
+        (typeof companyRaw === 'object' ? companyRaw?.name : companyRaw) ||
+        jsonLd.hiringOrganization?.name ||
+        ''
+    );
 
     const security_clearance = clearanceFromBlocks ||
         detail.security_clearance ||
@@ -90,24 +217,42 @@ function mapApiJob(job, detail = {}) {
         jsonLd.industry ||
         null;
 
-    const job_type = detail.position_type ||
+    const employmentType = detail.positionType ||
+        detail.position_type ||
         detail.job_type ||
         detail.employment_type ||
+        job.positionType ||
         job.position_type ||
         job.job_type ||
         (Array.isArray(jsonLd.employmentType) ? jsonLd.employmentType.join(', ') : jsonLd.employmentType) ||
         null;
 
-    return {
+    return compactRecord({
         id,
-        url: url || null,
+        url,
         title: normalizeSpace(job.title || job.job_title || jsonLd.title || ''),
-        company: normalizeSpace(job.company?.name || job.company || detail.company?.name || jsonLd.hiringOrganization?.name || ''),
+        company: companyName,
+        company_details: typeof companyRaw === 'object' ? companyRaw : undefined,
         location,
+        coordinates: detail.coordinates || job.coordinates,
+        address: detail.address,
         security_clearance,
-        salary: salary ? String(salary) : null,
-        job_type,
+        salary: salary ? String(salary) : undefined,
+        job_type: employmentType,
+        experience: detail.experience,
+        education: detail.education,
+        posted_date: postedFromBlocks || job.posted_date,
+        modified_time: job.modified_time,
         date_posted: job.posted_date || job.modified_time || job.created_at || detail.time || jsonLd.datePosted || null,
+        date_modified: jsonLd.dateModified || job.modified_time,
+        job_reference_id: jobReferenceId,
+        is_sponsored: detail.isSponsored ?? job.isSponsored,
+        is_backfilled: detail.isBackfilled ?? job.isBackfilled,
+        can_view_local: detail.canViewLocal ?? job.canViewLocal,
+        omitted: job.omitted,
+        cant_see_content: detail.cantSeeContent ?? job.cantSeeContent,
+        display_logo: job.display_logo,
+        short_description: job.shortDescription,
         description_html: descriptionHtml,
         description_text: descriptionHtml
             ? normalizeSpace(cheerio.load(descriptionHtml).text())
@@ -115,8 +260,11 @@ function mapApiJob(job, detail = {}) {
                 ? normalizeSpace(job.shortDescription)
                 : jsonLd.description
                     ? normalizeSpace(jsonLd.description)
-                    : null,
-    };
+                    : undefined,
+        badge: detail.badge || job.badge,
+        epp: detail.epp || job.epp,
+        source: BASE,
+    });
 }
 
 // Retry wrapper for API requests
@@ -227,13 +375,18 @@ async function collectFromApi({
             })
         );
 
+        const uniqueBatch = [];
         for (const item of results) {
             if (saved >= resultsWanted) break;
-            const key = item.url || item.id || JSON.stringify(item);
+            const key = buildDedupKey(item);
             if (!key || seen.has(key)) continue;
             seen.add(key);
-            await dataset.pushData(item);
+            uniqueBatch.push(item);
             saved += 1;
+        }
+
+        if (uniqueBatch.length) {
+            await dataset.pushData(uniqueBatch);
         }
 
         log.info(`Progress: ${saved}/${resultsWanted} jobs collected`);
@@ -281,18 +434,13 @@ await Actor.main(async () => {
 
     const seen = new Set();
 
-    const searchParams = {
-        locale: 'en',
-        sort,
+    const searchParams = buildSearchParams({
+        startUrl,
         keywords,
-    };
-
-    if (location) {
-        searchParams.city_state_zip = location;
-    }
-
-    if (remote === 'remote') searchParams.location_remote_option_filter = 'remote';
-    if (remote === 'hybrid') searchParams.location_remote_option_filter = 'hybrid';
+        location,
+        sort,
+        remote,
+    });
 
     const totalSaved = await collectFromApi({
         searchParams,
