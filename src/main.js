@@ -6,9 +6,9 @@ import { Impit } from 'impit';
 const BASE = 'https://clearedjobs.net';
 
 // ─── Concurrency cap for detail fetches ──────────────────────────────────────
-// 25 simultaneous connections saturates most proxies; 15 is the sweet spot.
+// 25 simultaneous connections saturates most proxies; 10 is the sweet spot to prevent 429 errors.
 // For local runs, reduce concurrency to prevent 429/403 errors from single IP (using 4 for optimal speed and safety).
-const DETAIL_CONCURRENCY = Actor.isAtHome() ? 15 : 4;
+const DETAIL_CONCURRENCY = Actor.isAtHome() ? 10 : 4;
 
 // ─── Client Manager for Proxy Rotation ────────────────────────────────────────
 
