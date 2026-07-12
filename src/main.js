@@ -53,7 +53,7 @@ async function check429Cooldown() {
     const timeSinceLast429 = now - last429Time;
     if (timeSinceLast429 < COOLDOWN_MS) {
         const wait = COOLDOWN_MS - timeSinceLast429 + Math.random() * 2000;
-        log.warning(`Global 429 cooldown active. Waiting ${Math.round(wait)}ms before next request.`);
+        log.debug(`Global 429 cooldown active. Waiting ${Math.round(wait)}ms before next request.`);
         await sleep(wait);
     }
 }
@@ -323,7 +323,7 @@ async function fetchWithRetry(clientManager, url, options = {}, maxRetries = 3) 
                 last429Time = Date.now();
                 if (attempt < maxRetries) {
                     const wait = 5000 * attempt + Math.random() * 2000;
-                    log.warning(`Rate limited (429) on ${url}, waiting ${Math.round(wait)}ms before retry ${attempt}`);
+                    log.debug(`Rate limited (429) on ${url}, waiting ${Math.round(wait)}ms before retry ${attempt}`);
                     await sleep(wait);
                     continue;
                 }
