@@ -1,10 +1,8 @@
 {
   "keywords": "engineer",
   "location": "",
-  "sort": "date",
-  "remote": "",
-  "results_wanted": 20,
-  "max_pages": 3,
+  "results_wanted": 100,
+  "max_pages": 10,
   "proxyConfiguration": {
     "useApifyProxy": true,
     "apifyProxyGroups": [
